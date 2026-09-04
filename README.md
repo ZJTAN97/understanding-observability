@@ -8,7 +8,7 @@ an HA RabbitMQ cluster and MinIO — first on Docker Compose, finally on k3d.
 | | |
 |---|---|
 | Pipeline | OpenTelemetry Collector (`contrib` distribution) |
-| Backend A | Grafana + Mimir / Loki / Tempo — phases 1–3 |
+| Backend A | Grafana + Prometheus / Loki / Tempo — phases 1–3 |
 | Backend B | Elasticsearch + Kibana — phase 4, same pipeline |
 | Demo app | Node.js + TypeScript (the only source of traces) |
 | Local runtime | Docker Compose → k3d in phase 5 |
@@ -23,7 +23,7 @@ phase without this README.
 | | Goal | Explainer | Code |
 |---|---|---|---|
 | **0** | Signals, OTLP, semconv, cardinality, Collector anatomy | [docs/phase-0-signals-and-collector.html](docs/phase-0-signals-and-collector.html) | [`phase-0/`](phase-0) |
-| 1 | Swap `debug` for a real backend: Grafana LGTM | | |
+| **1** | Swap `debug` for a real backend: Grafana LGTM | [docs/phase-1-grafana-lgtm.html](docs/phase-1-grafana-lgtm.html) | [`phase-1/`](phase-1) |
 | 2 | Instrument the Node app; propagate trace context through RabbitMQ | | |
 | 3 | Scrape MongoDB / RabbitMQ / MinIO; tail their logs; correlate | | |
 | 4 | Repoint the same pipeline at Elasticsearch + Kibana; compare | | |
@@ -45,6 +45,7 @@ alongside it, not run blind.
 
 ## Notes
 
-- Everything is pinned. Collector is `otel/opentelemetry-collector-contrib:0.149.0`.
+- Everything is pinned. Collector is `otel/opentelemetry-collector-contrib:0.149.0`;
+  Tempo `3.0.3`, Loki `3.7.7`, Prometheus `v3.14.0`, Grafana `13.2.1`.
 - 16 GB of RAM does not fit Grafana's stack and Elastic's stack at once. Tear one
   down before bringing the other up.

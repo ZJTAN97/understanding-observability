@@ -1,6 +1,3 @@
-# Phase 0 — the smallest useful Collector.
-# Nothing is stored anywhere; everything is printed to this container's stdout.
-
 receivers:                      # how data gets IN
   otlp:
     protocols:

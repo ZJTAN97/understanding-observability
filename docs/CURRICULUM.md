@@ -19,7 +19,7 @@ starting any phase.
 - [Conventions](#conventions)
 - [Definition of done](#definition-of-done)
 - [Phase 0 — Signals, OTLP, the Collector](#phase-0--signals-otlp-the-collector) ✅ done
-- [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm)
+- [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm) ✅ done
 - [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq)
 - [Phase 3 — Infrastructure signals](#phase-3--infrastructure-signals)
 - [Phase 4 — Swap in Elasticsearch and Kibana](#phase-4--swap-in-elasticsearch-and-kibana)
@@ -242,6 +242,8 @@ returns 404) · misspell `batch` as `batchh` (startup fails fatally).
 
 ## Phase 1 — A real backend: Grafana LGTM
 
+**Status: complete.** `docs/phase-1-grafana-lgtm.html`, `phase-1/`.
+
 **Objective.** Replace the `debug` exporter with real storage and a real UI,
 changing nothing else. Prove the seam.
 
@@ -267,17 +269,18 @@ Mimir is the horizontally-scalable replacement for Prometheus. Note the
 difference in the explainer; do not run it locally — Prometheus is enough and
 costs a fraction of the RAM.
 
-**Collector exporter block.**
+**Collector exporter block.** Collector 0.149 renamed the `otlp` and `otlphttp`
+exporters to `otlp_grpc` and `otlp_http`. The old ids still load but warn.
 
 ```yaml
 exporters:
-  otlp/tempo:
+  otlp_grpc/tempo:
     endpoint: tempo:4317
     tls:
       insecure: true            # local only, never in production
-  otlphttp/loki:
+  otlp_http/loki:
     endpoint: http://loki:3100/otlp     # NOT /otlp/v1/logs — see below
-  otlphttp/prometheus:
+  otlp_http/prometheus:
     endpoint: http://prometheus:9090/api/v1/otlp
 ```
 
@@ -311,6 +314,12 @@ the 404 · remove `tls.insecure` and watch the TLS handshake fail.
   in `prometheus.yml`, or `service.name` will not be queryable.
 - Tempo refuses to start without a valid `tempo.yaml`; there is no useful
   default. Same for Loki.
+- Tempo 3.x dropped the `ingester:` and `compactor:` config blocks in favour of
+  a live-store/block-builder architecture. Every pre-3.0 example config fails
+  with `field ingester not found in type app.Config`.
+- Tempo's OTLP receiver binds `127.0.0.1` by default. Set
+  `distributor.receivers.otlp.protocols.grpc.endpoint: 0.0.0.0:4317` or the
+  Collector cannot reach it.
 - Grafana provisioning files are read once at startup. Restart Grafana after
   editing them.
 

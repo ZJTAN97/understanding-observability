@@ -173,6 +173,19 @@ td:first-child{color:var(--ink);font-weight:500}
 }
 .check li:last-child{border-bottom:none}
 .check .q{font-family:var(--f-mono);font-size:11px;color:var(--ink-3);flex:none;padding-top:4px}
+.check .qa{flex:1;min-width:0}
+.check .qa > p{margin:0}
+.check details{margin-top:9px;font-size:15px;line-height:1.6;color:var(--ink-2)}
+.check summary{
+  font-family:var(--f-mono);font-size:11px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--metric);cursor:pointer;list-style:none;display:inline-block;
+}
+.check summary::-webkit-details-marker{display:none}
+.check summary::before{content:"\25B8\00a0"}
+.check details[open] summary::before{content:"\25BE\00a0"}
+.check details[open] summary{margin-bottom:9px}
+.check details p{margin:0 0 10px}
+.check details p:last-child{margin-bottom:0}
 
 /* ---------- steps ---------- */
 .step{display:flex;gap:18px;margin:0 0 30px}
@@ -211,6 +224,7 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
   <div class="shead"><span class="snum">01</span><h2>Where OpenTelemetry stops</h2></div>
   <div class="prose">
     <p class="lede">OpenTelemetry stores nothing and draws nothing. It is a way to <em>produce</em> telemetry and a pipe to <em>move</em> it. Everything below the pipe is a separate product decision.</p>
+    <p>Concretely, three things and no more: libraries that <strong>create</strong> the data, a wire format called <strong>OTLP</strong> that the data travels in, and the <strong>Collector</strong>, a relay process that receives it and forwards it somewhere. None of those three keeps a byte for longer than it takes to pass it on. To keep, query or chart anything you install a separate product &mdash; and OpenTelemetry is deliberately indifferent to which one.</p>
   </div>
 
   <figure>
@@ -310,6 +324,7 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
   </figure>
 
   <div class="prose">
+    <p>Concretely: an alert fires because the <code>checkout</code> latency metric crossed 2&nbsp;s. You open traces for slow checkouts and see the time is spent in one span, <code>publish orders.created</code>. You open that span's logs and read <code>connection reset by peer</code>. Three signals, three steps, each one narrower and more expensive than the last.</p>
     <p>A fourth signal, <strong>profiles</strong> (continuous CPU/heap profiling), reached stable status in OTEL recently. Ignore it until Phase 6 &mdash; it answers &ldquo;which line of code burned the CPU&rdquo;, one level below traces.</p>
   </div>
 </section>
@@ -319,6 +334,7 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
   <div class="shead"><span class="snum">03</span><h2>What is actually on the wire</h2></div>
   <div class="prose">
     <p class="lede">OTLP is not a flat list of events. It is three nested levels, and the outermost one &mdash; <code>resource</code> &mdash; is the level most people ignore and later regret.</p>
+    <p>Think of a parcel. The <strong>resource</strong> is the sender's address printed once on the outside of the box: who emitted this. The <strong>scope</strong> is the label on each bag inside: which library packed these. The <strong>records</strong> are the individual items &mdash; the spans, metric points or log lines. Writing the sender's address once per box instead of once per item is precisely why OTLP batches stay small, and it is why <code>service.name</code> is not a field on your span.</p>
   </div>
 
   <figure>
@@ -383,6 +399,7 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
   <div class="shead"><span class="snum">04</span><h2>Semantic conventions are the join key</h2></div>
   <div class="prose">
     <p class="lede">A dashboard that shows metrics, logs and traces for &ldquo;the order service&rdquo; only works if all three agree on what that service is called. That agreement is the spec called <strong>semantic conventions</strong>.</p>
+    <p>A semantic convention is nothing cleverer than an agreed spelling. The spec says: the HTTP verb is called <code>http.request.method</code> &mdash; not <code>method</code>, not <code>httpMethod</code>, not <code>verb</code> &mdash; and its value is the uppercase string. That is the entire idea. It matters because dashboards, alert rules and every &ldquo;jump from this trace to its logs&rdquo; button are written against those exact names by people who have never seen your code.</p>
   </div>
 
   <figure>
@@ -437,6 +454,7 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
   <div class="shead"><span class="snum">05</span><h2>Cardinality, the thing that kills clusters</h2></div>
   <div class="prose">
     <p class="lede">A metric is not one number. It is one number <em>per unique combination of its labels</em>. That multiplication is how a 2&nbsp;GB Prometheus becomes a 200&nbsp;GB Prometheus overnight.</p>
+    <p>The reason is how the storage is shaped. <code>{method=GET, route=/orders, status=200}</code> and <code>{method=POST, route=/orders, status=200}</code> are not two readings of one metric &mdash; they are two entirely separate <strong>time series</strong>, each with its own entry in the index and its own run of samples on disk, forever. Add a label and you do not add a column; you multiply the number of series by that label's number of distinct values.</p>
   </div>
 
   <figure>
@@ -607,6 +625,9 @@ footer{border-top:1px solid var(--rule);padding-top:28px;color:var(--ink-3);font
     <span class="c-key">logs</span>: { <span class="c-key">level</span>: <span class="c-str">info</span> }</code></pre>
 
   <div class="prose">
+    <p>Read that file bottom-up. The <code>service:</code> block is the only part that <em>does</em> anything; the three blocks above it are a parts bin. <code>receivers.otlp</code> defines a component named <code>otlp</code>, and the line <code>receivers: [otlp]</code> under <code>pipelines.traces</code> is what actually opens the port for traces. Delete the pipeline and the component sits there, configured and idle.</p>
+    <p>A <strong>pipeline</strong> is one signal's route: this list of receivers, through these processors in this order, out to these exporters. Three pipelines here means traces, metrics and logs each take their own route through the same process, sharing nothing but the binary.</p>
+
     <h3>Two distributions, pick the right one</h3>
     <div class="tw"><table>
       <thead><tr><th>Image</th><th>Contains</th><th>Use when</th></tr></thead>
@@ -802,13 +823,56 @@ Span ID: f445b22de650e099                    <span class="c-com">← to that exa
 <section id="s9">
   <div class="shead"><span class="snum">09</span><h2>Answer these before Phase 1</h2></div>
   <div class="prose">
+    <p>Answer each one out loud first, then open it. If your answer and the written one disagree, the disagreement is the useful part.</p>
     <ul class="check">
-      <li><span class="q">01</span><span>Which two layers of the stack does OpenTelemetry deliberately <em>not</em> provide, and why does that make backends swappable?</span></li>
-      <li><span class="q">02</span><span>A dashboard needs &ldquo;p99 latency of the checkout endpoint over 30 days&rdquo;. Which signal &mdash; and why not the other two?</span></li>
-      <li><span class="q">03</span><span>Where does <code>service.name</code> live: on the span, the scope, or the resource? What breaks if two services share one?</span></li>
-      <li><span class="q">04</span><span>Why is <code>user_id</code> fine as a span attribute but not as a metric label?</span></li>
-      <li><span class="q">05</span><span>You added an exporter and no data reaches it. What is the first line of config to check?</span></li>
-      <li><span class="q">06</span><span>MongoDB is running. What must exist for traces of Mongo queries to appear &mdash; and why is the answer not &ldquo;a Collector receiver&rdquo;?</span></li>
+      <li><span class="q">01</span><div class="qa">
+        <p>Which two layers of the stack does OpenTelemetry deliberately <em>not</em> provide, and why does that make backends swappable?</p>
+        <details><summary>Answer</summary>
+          <p><strong>Storage and query/visualisation</strong> &mdash; everything below the dashed seam. OTEL provides instrumentation, OTLP and the Collector, and stops.</p>
+          <p>Swappability follows from where the boundary sits. Your application only ever talks to the SDK, and the SDK only ever speaks OTLP to the Collector. Neither knows the backend exists. Changing from Tempo to Elasticsearch is therefore an edit to the <code>exporters</code> block of one config file and a Collector restart &mdash; no application change, no redeploy of any service, no re-instrumentation.</p>
+        </details>
+      </div></li>
+
+      <li><span class="q">02</span><div class="qa">
+        <p>A dashboard needs &ldquo;p99 latency of the checkout endpoint over 30 days&rdquo;. Which signal &mdash; and why not the other two?</p>
+        <details><summary>Answer</summary>
+          <p><strong>Metrics</strong> &mdash; a histogram such as <code>http.server.request.duration</code>, filtered to <code>http.route=/checkout</code>. It is a handful of series, pre-aggregated at write time, and a year of it is cheap.</p>
+          <p>Not traces: traces are sampled, so a p99 computed from them is the p99 <em>of the survivors</em>, not of production &mdash; and keeping 30 days of unsampled traces is exactly the bill you are trying not to pay. Not logs: you would scan 30 days of raw events on every dashboard refresh, paying the most expensive storage in the stack to recompute a number metrics hand you for free.</p>
+          <p>The right division of labour: the metric tells you the p99 got worse; you then go to traces to find out which hop caused it.</p>
+        </details>
+      </div></li>
+
+      <li><span class="q">03</span><div class="qa">
+        <p>Where does <code>service.name</code> live: on the span, the scope, or the resource? What breaks if two services share one?</p>
+        <details><summary>Answer</summary>
+          <p>On the <strong>resource</strong> &mdash; the outermost level, sent once per batch, next to <code>service.version</code> and <code>deployment.environment</code>. It is not a span field, which is why you will never find it inside a span in the JSON.</p>
+          <p>If two genuinely different services claim the same name, the backend treats them as one entity. Their metrics are summed together, the service map draws one node instead of two, and no query, filter or alert can separate them again &mdash; the information was lost before storage. The mirror-image failure is just as common: one service that reports <code>order-api</code> in its metrics and <code>orderapi</code> in its logs shows up as two half-services, and every correlation between them silently returns nothing.</p>
+        </details>
+      </div></li>
+
+      <li><span class="q">04</span><div class="qa">
+        <p>Why is <code>user_id</code> fine as a span attribute but not as a metric label?</p>
+        <details><summary>Answer</summary>
+          <p>Because a metric label is part of the <em>series identity</em>. Every distinct <code>user_id</code> creates a new time series with its own index entry, and it stays there long after the user has gone. Ten thousand users multiply your existing series count by ten thousand &mdash; the 14,400 &rarr; 144,000,000 in the diagram above.</p>
+          <p>A span attribute is just a field on one record. It is written once with that span, retrieved by trace id, and never participates in a cross-product. High-cardinality values cost one string of storage there, which is the correct price for them. Same rule for log fields.</p>
+        </details>
+      </div></li>
+
+      <li><span class="q">05</span><div class="qa">
+        <p>You added an exporter and no data reaches it. What is the first line of config to check?</p>
+        <details><summary>Answer</summary>
+          <p><code>service.pipelines.&lt;signal&gt;.exporters</code>. Defining a component under the top-level <code>exporters:</code> block only <em>declares</em> it; it is inert until a pipeline names it in that list. This is the single most common Collector mistake and it fails silently &mdash; the Collector starts cleanly and reports no error, because an unreferenced component is legal config.</p>
+          <p>Second check, same line: the right signal. An exporter added to the <code>traces</code> pipeline will never see a metric.</p>
+        </details>
+      </div></li>
+
+      <li><span class="q">06</span><div class="qa">
+        <p>MongoDB is running. What must exist for traces of Mongo queries to appear &mdash; and why is the answer not &ldquo;a Collector receiver&rdquo;?</p>
+        <details><summary>Answer</summary>
+          <p>An <strong>instrumented Mongo client library in your application</strong>. The span is created by the driver on the calling side: it starts a timer when the query goes out, ends it when the reply comes back, attaches <code>db.system=mongodb</code> and <code>db.collection.name</code>, and &mdash; the part that matters &mdash; makes it a child of whatever request span is currently in context.</p>
+          <p>The <code>mongodb</code> receiver cannot do any of that. It polls the server from the outside every 30&nbsp;s and asks <code>serverStatus</code> for counters. It never observes an individual query, has no notion of the request that caused one, and holds no trace id to parent a span to. Receivers can manufacture metrics and forward logs; they cannot invent traces. MongoDB itself contains no OpenTelemetry code, so nothing inside it will ever hand you one.</p>
+        </details>
+      </div></li>
     </ul>
   </div>
 
