@@ -1,0 +1,45 @@
+# Phase 0 — the smallest useful Collector.
+# Nothing is stored anywhere; everything is printed to this container's stdout.
+
+receivers:                      # how data gets IN
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:                     # what happens on the way through
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75        # shed load before the OOM killer does
+    spike_limit_percentage: 15
+  batch:
+    timeout: 1s
+
+exporters:                      # where data goes OUT
+  debug:
+    verbosity: detailed
+
+extensions:                     # cross-cutting, not part of a pipeline
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:                        # nothing above is active until it is named here
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug]
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug]
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug]
+  telemetry:
+    logs:
+      level: info

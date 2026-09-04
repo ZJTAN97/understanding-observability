@@ -1,0 +1,19 @@
+name: obs-phase-0
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.149.0
+    container_name: otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"    # OTLP/gRPC
+      - "4318:4318"    # OTLP/HTTP
+      - "13133:13133"  # health_check extension
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
