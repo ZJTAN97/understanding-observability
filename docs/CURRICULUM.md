@@ -20,7 +20,7 @@ starting any phase.
 - [Definition of done](#definition-of-done)
 - [Phase 0 — Signals, OTLP, the Collector](#phase-0--signals-otlp-the-collector) ✅ done
 - [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm) ✅ done
-- [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq)
+- [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq) ✅ done
 - [Phase 3 — Infrastructure signals](#phase-3--infrastructure-signals)
 - [Phase 4 — Swap in Elasticsearch and Kibana](#phase-4--swap-in-elasticsearch-and-kibana)
 - [Phase 5 — Kubernetes on k3d](#phase-5--kubernetes-on-k3d)
@@ -72,7 +72,7 @@ demo app the project is a metrics-and-logs exercise. The app is not optional.
 | Collector distribution | `otel/opentelemetry-collector-contrib` | Every receiver we need (`prometheus`, `filelog`, `mongodb`, `rabbitmq`, `k8sattributes`, `fluentforward`) is contrib-only. The `core` image will fail with `unknown type`. |
 | Backend A | Grafana + Prometheus/Mimir + Loki + Tempo | Lighter than Elastic. Its three query languages force you to learn what actually distinguishes the three signals. |
 | Backend B | Elasticsearch + Kibana | One engine for all signals, search-first model. Ships in Phase 4 so the comparison is grounded in real use, not a feature matrix. |
-| Demo app | Node.js + TypeScript | User's strongest language. JS auto-instrumentation covers `http`, `express`/`fastify`, `amqplib`, `mongodb`, `aws-sdk` and `pino` — the whole path. |
+| Demo app | Spring Boot 3.5 on Java 21 | Instrumented by the OTel Java agent, which covers Tomcat, Spring AMQP, the AMQP client, the Mongo driver, OkHttp and Logback — the whole path — with no code change and no OTel dependency for tracing. |
 | Local runtime, phases 0–4 | Docker Compose | Kubernetes adds a second learning axis (operators, CRDs, RBAC, DaemonSets) that obscures the OTEL concepts. |
 | Local runtime, phase 5 | **k3d** | ~500 MB overhead vs ~1 GB for kind and ~2 GB for minikube. Ships Traefik and a LoadBalancer so `http://grafana.localhost` works with no port-forward. Diverges slightly from upstream (sqlite instead of etcd) — irrelevant here. |
 | Container runtime | OrbStack recommended over Docker Desktop | Roughly half the idle RAM, faster disk, same CLI. On 16 GB this is not cosmetic. |
@@ -124,7 +124,7 @@ phase-N/
   otel-collector-config.yaml
   <service>/                  per-service config, e.g. tempo/, loki/, grafana/
   README.md                   run instructions + verification for this phase only
-app/                          the Node/TS demo app (created in phase 2)
+app/                          the Spring Boot demo app (created in phase 2)
 k8s/                          manifests and Helm values (created in phase 5)
 ```
 
@@ -327,6 +327,8 @@ the 404 · remove `tls.insecure` and watch the TLS handshake fail.
 
 ## Phase 2 — Instrument the app, propagate through RabbitMQ
 
+**Status: complete.** `docs/phase-2-instrument-the-app.html`, `phase-2/`, `app/`.
+
 **Objective.** Produce real distributed traces. This is the phase where
 OpenTelemetry stops being plumbing and starts being useful.
 
@@ -335,29 +337,31 @@ RabbitMQ and MinIO. Clustering them is Phase 3's job. Do not conflate the two.
 
 **Concepts.**
 
-- The Node SDK: `NodeSDK`, resource detectors, exporters, shutdown hooks
-- Why instrumentation must load *before* application code, and how that differs
-  between CJS (`--require`) and ESM (`--import`)
+- The Java agent: `-javaagent`, `premain`, bytecode transformation at class load
+- Why instrumentation must be installed *before* application code, and why Java
+  makes that structurally impossible to get wrong where Node does not
 - Automatic vs manual instrumentation; when to add a custom span
 - Span kinds: SERVER, CLIENT, PRODUCER, CONSUMER
 - **Context propagation across a message queue** — the hard case. `traceparent`
   travels in AMQP message headers, injected on publish and extracted on consume.
+- Instrumentation scope: which module emitted a span, and why two modules
+  covering the same protocol both fire
 - Span links vs parent-child, and why batch consumers need links
-- Log correlation at source: `pino` + `instrumentation-pino` stamping
+- Log correlation at source: Logback + the agent's MDC instrumentation stamping
   `trace_id`/`span_id` into every log line
 - Custom metrics: a counter and a histogram, and choosing their labels
 
 **Application shape.**
 
 ```
-POST /orders  ──▶  api (fastify)
+POST /orders  ──▶  api (Spring MVC)
                      │  validate
                      │  publish → exchange "orders", routing key "orders.created"
                      ▼
                   RabbitMQ
                      │
                      ▼
-                   worker
+                   worker (@RabbitListener)
                      │  insert document      → MongoDB
                      │  put receipt object   → MinIO
                      │  update document      → MongoDB
@@ -365,20 +369,51 @@ POST /orders  ──▶  api (fastify)
 
 Two separate services with two different `service.name` values — `order-api`
 and `order-worker`. That is what makes the Grafana service graph non-trivial.
+One jar runs as both: `SPRING_PROFILES_ACTIVE` selects the half,
+`OTEL_SERVICE_NAME` selects the identity, and neither is in the code.
+
+**Instrumentation choice.** Three paths exist for Spring Boot, and they are not
+interchangeable:
+
+| | owner | wiring | coverage |
+|---|---|---|---|
+| **OTel Java agent** ← *this phase* | OpenTelemetry | `-javaagent:` flag | ~130 libraries |
+| OTel Spring Boot starter | OpenTelemetry | one dependency | narrower; works with native image |
+| Micrometer + `micrometer-tracing-bridge-otel` | **Spring** | dependency + `management.*` properties | only what Spring instruments |
+
+OpenTelemetry recommends the agent and treats the starter as the fallback for
+when an agent cannot run. Spring recommends neither, and points at Micrometer
+Observation — their objections are the agent's alpha jars, its incompatibility
+with GraalVM native image and the AOT cache, and version-mismatch diagnosis. In
+Spring Boot 4.0 their position ships as `org.springframework.boot:spring-boot-starter-opentelemetry`,
+confusingly close in name to OpenTelemetry's own.
+
+The agent is chosen here for three reasons, in order: it reads the same `OTEL_*`
+environment variables as every other SDK in this curriculum, so one
+configuration vocabulary covers all phases; it is the only zero-code path that
+instruments non-Spring client libraries such as the AWS SDK; and `-javaagent` is
+the direct analogue of the `--require` hook that phase 2 exists to teach.
+
+The Micrometer path's two concrete gaps are worth knowing even if unused: it
+does not instrument the AWS SDK at all, and Spring AMQP ships with
+`observationEnabled = false`, so `traceparent` is never injected until you set
+it explicitly on both `RabbitTemplate` and the listener container factory.
 
 **Dependencies.**
 
 ```
-@opentelemetry/sdk-node
-@opentelemetry/auto-instrumentations-node
-@opentelemetry/exporter-trace-otlp-http
-@opentelemetry/exporter-metrics-otlp-http
-@opentelemetry/exporter-logs-otlp-http
-@opentelemetry/resources  @opentelemetry/semantic-conventions
-fastify  amqplib  mongodb  @aws-sdk/client-s3  pino
+org.springframework.boot:spring-boot-starter-web
+org.springframework.boot:spring-boot-starter-amqp
+org.springframework.boot:spring-boot-starter-data-mongodb
+org.springframework.boot:spring-boot-starter-actuator
+io.minio:minio                          8.5.17 — 8.6.0+ needs OkHttp 5, which does not build under Maven
+io.opentelemetry:opentelemetry-api      API only, for the two hand-written metrics
 ```
 
-**Configuration by environment variable, not code.** The SDK reads these:
+The agent jar is **not** a dependency. It is downloaded in the Dockerfile at a
+pinned version and attached to the JVM.
+
+**Configuration by environment variable, not code.** The agent reads these:
 
 ```sh
 OTEL_SERVICE_NAME=order-api
@@ -386,44 +421,67 @@ OTEL_RESOURCE_ATTRIBUTES=service.namespace=shop,deployment.environment=local,ser
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_TRACES_SAMPLER=always_on          # phase 6 changes this
-OTEL_NODE_RESOURCE_DETECTORS=env,host,os,container
+OTEL_LOGS_EXPORTER=otlp
 ```
 
-Keeping `service.name` in the environment rather than the code is what makes the
-same image runnable as both api and worker.
+Nothing in `application.yaml` mentions OpenTelemetry.
 
 **Load generator.** A shell loop or `k6` script producing steady traffic plus an
-occasional error, so dashboards have something to show.
+occasional error, so dashboards have something to show. Gate it on the API's
+healthcheck, not on container start — a JVM needs ~5 s to serve.
 
 **Verification.** One trace in Tempo containing, in order: `POST /orders`
-(SERVER, order-api) → `orders.created publish` (PRODUCER, order-api) →
-`orders.created process` (CONSUMER, order-worker) → `mongodb.insert` (CLIENT) →
-`S3.PutObject` (CLIENT) → `mongodb.update` (CLIENT). Six spans, two services,
-one `trace_id`. The service graph shows `order-api → order-worker`.
+(SERVER, order-api) → `orders publish` (PRODUCER, order-api) →
+`orders.created process` (CONSUMER, order-worker) → `insert shop.orders`
+(CLIENT) → `PUT` (CLIENT, the MinIO write) → `update shop.orders` (CLIENT).
+Seven spans, two services, one `trace_id`. The service graph shows
+`order-api → order-worker`. A `{status=error}` search in Tempo returns the
+oversized orders, with an `exception` event carrying type, message and stack
+trace on the CONSUMER span.
 
 **Breaks.**
 
-- Load `instrumentation.ts` *after* the app imports (`import './app'` first) —
-  auto-instrumentation silently produces nothing. This is the number-one
-  real-world OTEL failure and must be experienced once.
-- Consume messages into an array and process them later, outside the callback —
-  context is lost and the worker's spans become orphan roots.
+- Remove `-javaagent` from `order-api` — the service produces nothing, logs no
+  error, and loses `trace_id` from every log line while continuing to serve
+  traffic normally. This is the number-one real-world OTEL failure and must be
+  experienced once.
+- Consume messages into a `BlockingQueue` and process them on a thread you
+  started yourself — context is lost and the worker's spans become orphan roots.
 - Set `OTEL_SERVICE_NAME` identically for api and worker — the service graph
-  collapses and correlation becomes useless.
+  collapses into a self-edge and correlation becomes useless.
 
 **Gotchas.**
 
-- ESM requires `node --import ./dist/instrumentation.js dist/main.js`. With CJS
-  it is `node -r ./dist/instrumentation.js dist/main.js`. Mixing them is the
-  usual cause of "no spans at all".
-- MinIO through `@aws-sdk/client-s3` needs `forcePathStyle: true` and a dummy
-  region. Instrumentation comes from `@opentelemetry/instrumentation-aws-sdk`.
-- MongoDB instrumentation's `enhancedDatabaseReporting` captures query
-  documents. Useful locally, a PII and cardinality hazard elsewhere. Say so in
-  the explainer.
-- Call `sdk.shutdown()` on `SIGTERM` or the last batch is lost on every restart.
-- `amqplib` instrumentation covers `publish` and `consume`. Anything that
-  detaches from the callback context needs a manual `context.with()`.
+- The agent must be attached at JVM start. There is no equivalent of Node's
+  "imported the app first" mistake, because `premain` runs before `main` by
+  construction — but there is no warning either when the flag is simply absent.
+- Pin the agent version. Every tutorial links
+  `releases/latest/download/opentelemetry-javaagent.jar`, which silently changes
+  your instrumentation between two builds of the same commit.
+- Two instrumentation modules cover RabbitMQ: `rabbitmq-2.7` (the AMQP client)
+  and `spring-rabbit-1.0` (the `@RabbitListener`). Both emit a CONSUMER span for
+  one message. Disabling the shallow-looking one destroys the trace, because
+  header injection lives there and not in the Spring module.
+- The MinIO Java client is not the AWS SDK. Its spans come from OkHttp and are
+  named `PUT`, with no `aws.s3.*` attributes — the bucket and key survive only
+  inside `url.full`. Use `software.amazon.awssdk:s3` if you want S3 semantics.
+- **A caught exception is invisible to the agent.** Instrumentation marks a span
+  ERROR only when the method it wrapped throws. A `try/catch` inside your own
+  method never crosses a library boundary, so a service that degrades gracefully
+  degrades silently in its traces. Measured here: 29 logged failures, 0 error
+  spans. The remedy is two lines of the OTel API —
+  `Span.current().recordException(e)` and `setStatus(StatusCode.ERROR, ...)`.
+  Letting the exception escape a `@RabbitListener` instead trades the silent
+  failure for a requeue loop unless `default-requeue-rejected=false` or a DLQ is
+  configured.
+- MongoDB instrumentation can capture query documents
+  (`otel.instrumentation.mongo.statement-sanitizer.enabled=false`). Useful
+  locally, a PII and cardinality hazard elsewhere. Say so in the explainer.
+- A JVM under `mem_limit: 256m` starts and is then OOM-killed under load. Budget
+  512m per service and set `-XX:MaxRAMPercentage`.
+- The AMQP client emits `exchange.declare`, `queue.declare`, `queue.bind` and a
+  `basic.ack` root trace per message. Protocol bookkeeping, not application
+  work, and the first candidate for a `filter` processor.
 
 ---
 
@@ -706,10 +764,11 @@ Consolidated, in the order they will be hit.
    becomes `orders_created_total`.
 5. Expecting resource attributes to be Prometheus labels. They are not, unless
    promoted explicitly.
-6. Loading Node instrumentation after application code, or mixing the CJS
-   `--require` and ESM `--import` forms. Symptom: zero spans, no error.
-7. Losing async context in a RabbitMQ consumer by processing outside the
-   delivery callback. Symptom: orphan root spans in the worker.
+6. Starting the JVM without `-javaagent`, or pinning it to
+   `releases/latest/download/`. Symptom: zero spans and no error, or
+   instrumentation that changes version between two builds of one commit.
+7. Losing context in a RabbitMQ consumer by handing the message to a thread the
+   agent does not recognise. Symptom: orphan root spans in the worker.
 8. Reusing one `service.name` across two services. Correlation and the service
    graph both degrade silently.
 9. MinIO metrics returning 401. Either set

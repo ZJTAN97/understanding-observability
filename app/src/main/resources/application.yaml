@@ -1,0 +1,58 @@
+# Nothing in this file configures OpenTelemetry. The agent is configured entirely
+# by OTEL_* environment variables in phase-2/docker-compose.yaml, which is the
+# same spec the Collector and every other OTel SDK reads.
+spring:
+  application:
+    name: ${OTEL_SERVICE_NAME:orders}
+  rabbitmq:
+    addresses: ${AMQP_URL:amqp://guest:guest@rabbitmq:5672}
+  data:
+    mongodb:
+      uri: ${MONGO_URL:mongodb://mongodb:27017/shop}
+
+app:
+  exchange: orders
+  routing-key: orders.created
+  queue: orders
+  detach-context: ${APP_DETACH_CONTEXT:false}
+  s3:
+    endpoint: ${S3_ENDPOINT:http://minio:9000}
+    bucket: ${S3_BUCKET:receipts}
+    access-key: ${S3_ACCESS_KEY:minioadmin}
+    secret-key: ${S3_SECRET_KEY:minioadmin}
+
+server:
+  port: ${PORT:3001}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+logging:
+  # trace_id/span_id come from MDC, put there by the agent's logback instrumentation.
+  # The same instrumentation mirrors every line into the OTLP logs pipeline, which
+  # is what makes the Loki -> Tempo link work without any correlation code.
+  pattern:
+    level: "%5p [%mdc{trace_id:-},%mdc{span_id:-}]"
+
+---
+spring:
+  config:
+    activate:
+      on-profile: api
+  # The API never touches Mongo. Without this, Boot builds a MongoClient it
+  # never uses and the api opens a pointless connection to the database.
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.mongo.MongoDataAutoConfiguration
+
+---
+spring:
+  config:
+    activate:
+      on-profile: worker
+  main:
+    web-application-type: none
