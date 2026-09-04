@@ -13,6 +13,11 @@ an HA RabbitMQ cluster and MinIO — first on Docker Compose, finally on k3d.
 | Demo app | Node.js + TypeScript (the only source of traces) |
 | Local runtime | Docker Compose → k3d in phase 5 |
 
+**Full build spec: [docs/CURRICULUM.md](docs/CURRICULUM.md)** — every phase in
+detail, with deliverables, verification steps, and the accumulated gotcha list.
+That file is self-contained; hand it to another agent and they can build any
+phase without this README.
+
 ## Phases
 
 | | Goal | Explainer | Code |
