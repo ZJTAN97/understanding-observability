@@ -20,6 +20,9 @@ class ApiController {
 
   private static final Logger log = LoggerFactory.getLogger(ApiController.class);
   private static final AttributeKey<String> CHANNEL = AttributeKey.stringKey("channel");
+  // Deliberate break #4: order.id is unique per request. One label, one series
+  // per order, forever. See phase-3/README.md.
+  private static final AttributeKey<String> ORDER_ID = AttributeKey.stringKey("order.id");
 
   private final RabbitTemplate rabbit;
   private final AppProperties cfg;
@@ -50,7 +53,9 @@ class ApiController {
     // the worker's spans end up in this trace instead of starting their own.
     rabbit.convertAndSend(cfg.exchange(), cfg.routingKey(), order);
 
-    telemetry.ordersCreated.add(1, Attributes.of(CHANNEL, order.channel()));
+    telemetry.ordersCreated.add(1, cfg.highCardinalityLabel()
+        ? Attributes.of(CHANNEL, order.channel(), ORDER_ID, order.id())
+        : Attributes.of(CHANNEL, order.channel()));
     log.info("published orders.created order.id={} order.sku={}", order.id(), order.sku());
 
     return ResponseEntity.accepted().body(Map.of("id", order.id()));

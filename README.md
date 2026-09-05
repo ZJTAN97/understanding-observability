@@ -25,7 +25,7 @@ phase without this README.
 | **0** | Signals, OTLP, semconv, cardinality, Collector anatomy | [docs/phase-0-signals-and-collector.html](docs/phase-0-signals-and-collector.html) | [`phase-0/`](phase-0) |
 | **1** | Swap `debug` for a real backend: Grafana LGTM | [docs/phase-1-grafana-lgtm.html](docs/phase-1-grafana-lgtm.html) | [`phase-1/`](phase-1) |
 | **2** | Instrument the Spring Boot app; propagate trace context through RabbitMQ | [docs/phase-2-instrument-the-app.html](docs/phase-2-instrument-the-app.html) | [`phase-2/`](phase-2), [`app/`](app) |
-| 3 | Scrape MongoDB / RabbitMQ / MinIO; tail their logs; correlate | | |
+| **3** | Real topologies, then observe them: scrape MongoDB / RabbitMQ / MinIO, tail their logs, drop 63% of the series at the pipe | [docs/phase-3-infrastructure-signals.html](docs/phase-3-infrastructure-signals.html) | [`phase-3/`](phase-3) |
 | 4 | Repoint the same pipeline at Elasticsearch + Kibana; compare | | |
 | 5 | Port to Kubernetes on k3d: OTEL Operator, agent vs gateway | | |
 | 6 | Sampling, cardinality control, alerting, SLOs | | |
@@ -48,6 +48,6 @@ alongside it, not run blind.
 - Everything is pinned. Collector is `otel/opentelemetry-collector-contrib:0.149.0`;
   Tempo `3.0.3`, Loki `3.7.7`, Prometheus `v3.14.0`, Grafana `13.2.1`, MongoDB
   `8.2.1`, RabbitMQ `4.2.0-management`, MinIO `RELEASE.2025-09-07T16-13-09Z`,
-  Temurin `21.0.12_8`, OTel Java agent `2.31.1`.
+  Temurin `21.0.12_8`, OTel Java agent `2.31.1`, Percona `mongodb_exporter:0.53.0`.
 - 16 GB of RAM does not fit Grafana's stack and Elastic's stack at once. Tear one
   down before bringing the other up.

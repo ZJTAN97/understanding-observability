@@ -14,7 +14,9 @@ app:
   exchange: orders
   routing-key: orders.created
   queue: orders
+  queue-type: ${QUEUE_TYPE:classic}
   detach-context: ${APP_DETACH_CONTEXT:false}
+  high-cardinality-label: ${APP_HIGH_CARDINALITY_LABEL:false}
   s3:
     endpoint: ${S3_ENDPOINT:http://minio:9000}
     bucket: ${S3_BUCKET:receipts}

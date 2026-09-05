@@ -1,0 +1,419 @@
+name: obs-phase-3
+
+# Phase 2's single-node infrastructure, promoted to its real topology and, for
+# the first time, observed. Three mongods in a replica set, three RabbitMQ nodes
+# with a quorum queue, four MinIO nodes in one erasure set.
+#
+# Log routing is deliberately not uniform:
+#   order-api, order-worker   push OTLP logs (the agent does it)
+#   mongo1                    --logpath into a shared volume -> filelog receiver
+#   everything else infra     fluentd logging driver -> fluentforward receiver
+# Three ways to get a log line into the same pipeline, on purpose.
+
+x-fluentd: &fluentd-logging
+  driver: fluentd
+  options:
+    fluentd-address: localhost:24224
+    # The tag is the only identity the receiver gets. Default is the container
+    # ID; the container name is what a human can read in Loki.
+    tag: "{{.Name}}"
+    # async so a container starts even when the Collector is not listening yet,
+    # instead of failing with "failed to initialize logging driver".
+    fluentd-async: "true"
+
+services:
+
+# ================================================================== application
+  order-api:
+    build: ../app
+    image: obs-demo-app:0.1.0
+    container_name: order-api
+    command:
+      - java
+      - -javaagent:/otel/opentelemetry-javaagent.jar
+      - -XX:MaxRAMPercentage=70
+      - -jar
+      - /app/app.jar
+    environment:
+      SPRING_PROFILES_ACTIVE: api
+      OTEL_SERVICE_NAME: order-api
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=shop,deployment.environment=local,service.version=0.1.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: always_on
+      OTEL_LOGS_EXPORTER: otlp
+      # All three brokers. The client fails over; the quorum queue's leader may
+      # be on any of them.
+      AMQP_URL: amqp://guest:guest@rabbitmq1:5672,amqp://guest:guest@rabbitmq2:5672,amqp://guest:guest@rabbitmq3:5672
+      QUEUE_TYPE: quorum
+      APP_HIGH_CARDINALITY_LABEL: "false"   # set to true for deliberate break #4
+      PORT: "3001"
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 512m
+    depends_on:
+      rabbitmq1: { condition: service_healthy }
+      rabbitmq2: { condition: service_healthy }
+      rabbitmq3: { condition: service_healthy }
+
+  order-worker:
+    build: ../app
+    image: obs-demo-app:0.1.0
+    container_name: order-worker
+    command:
+      - java
+      - -javaagent:/otel/opentelemetry-javaagent.jar
+      - -XX:MaxRAMPercentage=70
+      - -jar
+      - /app/app.jar
+    environment:
+      SPRING_PROFILES_ACTIVE: worker
+      OTEL_SERVICE_NAME: order-worker
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=shop,deployment.environment=local,service.version=0.1.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: always_on
+      OTEL_LOGS_EXPORTER: otlp
+      AMQP_URL: amqp://guest:guest@rabbitmq1:5672,amqp://guest:guest@rabbitmq2:5672,amqp://guest:guest@rabbitmq3:5672
+      QUEUE_TYPE: quorum
+      # Seed list, replicaSet name, and the driver does the rest: it finds the
+      # topology, tracks the primary and re-routes on election.
+      MONGO_URL: mongodb://app:apppw@mongo1:27017,mongo2:27017,mongo3:27017/shop?replicaSet=rs0&authSource=admin
+      S3_ENDPOINT: http://minio1:9000
+    mem_limit: 512m
+    depends_on:
+      rabbitmq1: { condition: service_healthy }
+      mongo-init: { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+
+  loadgen:
+    image: curlimages/curl:8.18.0
+    container_name: loadgen
+    entrypoint: ["sh", "/loadgen.sh"]
+    volumes:
+      - ./loadgen.sh:/loadgen.sh:ro
+    mem_limit: 32m
+    depends_on:
+      order-api: { condition: service_healthy }
+
+# ============================================== MongoDB — 3-node replica set
+# mongo1 logs to a file on a shared volume; mongo2 and mongo3 log to stdout.
+# Same daemon, two collection mechanisms, one Loki.
+  mongo1:
+    image: mongo:8.2.1
+    container_name: mongo1
+    hostname: mongo1
+    command:
+      - --replSet=rs0
+      - --keyFile=/keyfile/mongo.key
+      - --bind_ip_all
+      - --wiredTigerCacheSizeGB=0.25
+      - --logpath=/var/log/mongodb/mongod.log
+      - --logappend
+    environment:
+      # The entrypoint strips --replSet, --keyFile and --auth for a temporary
+      # local mongod, creates this user, then restarts with the real flags.
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpw
+    volumes:
+      - mongo1-data:/data/db
+      - mongo1-logs:/var/log/mongodb
+      - mongo-keyfile:/keyfile:ro
+    ports:
+      - "27017:27017"
+    mem_limit: 512m
+    depends_on:
+      mongo-keygen: { condition: service_completed_successfully }
+
+  mongo2:
+    container_name: mongo2
+    image: mongo:8.2.1
+    hostname: mongo2
+    command: [--replSet=rs0, --keyFile=/keyfile/mongo.key, --bind_ip_all, --wiredTigerCacheSizeGB=0.25]
+    volumes:
+      - mongo2-data:/data/db
+      - mongo-keyfile:/keyfile:ro
+    logging: *fluentd-logging
+    mem_limit: 512m
+    depends_on:
+      mongo-keygen: { condition: service_completed_successfully }
+
+  mongo3:
+    container_name: mongo3
+    image: mongo:8.2.1
+    hostname: mongo3
+    command: [--replSet=rs0, --keyFile=/keyfile/mongo.key, --bind_ip_all, --wiredTigerCacheSizeGB=0.25]
+    volumes:
+      - mongo3-data:/data/db
+      - mongo-keyfile:/keyfile:ro
+    logging: *fluentd-logging
+    mem_limit: 512m
+    depends_on:
+      mongo-keygen: { condition: service_completed_successfully }
+
+  # Members of a replica set authenticate to each other with a shared secret.
+  # It has to be mode 400 and owned by the mongodb user, which a bind mount from
+  # macOS cannot provide — hence a volume written by a throwaway container.
+  mongo-keygen:
+    image: mongo:8.2.1
+    entrypoint:
+      - sh
+      - -c
+      - "test -f /keyfile/mongo.key || (openssl rand -base64 756 > /keyfile/mongo.key && chmod 400 /keyfile/mongo.key && chown 999:999 /keyfile/mongo.key)"
+    volumes:
+      - mongo-keyfile:/keyfile
+    mem_limit: 64m
+
+  mongo-init:
+    image: mongo:8.2.1
+    entrypoint:
+      - sh
+      - -c
+      - "until mongosh --quiet --host mongo1 -u root -p rootpw --authenticationDatabase admin --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; do sleep 1; done;
+         mongosh --host mongo1 -u root -p rootpw --authenticationDatabase admin /init/init-rs.js"
+    volumes:
+      - ./mongo/init-rs.js:/init/init-rs.js:ro
+    mem_limit: 128m
+    depends_on: [mongo1, mongo2, mongo3]
+
+  # The mongodb receiver reads serverStatus and dbStats. It does not read
+  # replSetGetStatus, so replication lag and the oplog window — the two numbers
+  # a replica set is actually judged on — are not available from it at all.
+  # This is why a second, redundant metric source exists.
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.53.0
+    container_name: mongodb-exporter
+    command:
+      - --mongodb.uri=mongodb://otel:otelpw@mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0&authSource=admin&directConnection=false
+      # Defaults to true, which is invalid with a multi-host URI and is the
+      # only reason the exporter reports mongodb_up 0 with a seed list.
+      - --no-mongodb.direct-connect
+      - --collect-all            # every collector, including replsetstatus
+      - --compatible-mode        # also emit the old mongodb_* metric names
+      - --web.listen-address=:9216
+    ports:
+      - "9216:9216"
+    logging: *fluentd-logging
+    mem_limit: 128m
+    depends_on:
+      mongo-init: { condition: service_completed_successfully }
+
+# ================================================== RabbitMQ — 3-node cluster
+  rabbitmq1: &rabbitmq
+    image: rabbitmq:4.2.0-management
+    container_name: rabbitmq1
+    hostname: rabbitmq1
+    environment:
+      # Cluster members are authenticated by a shared Erlang cookie. Same value
+      # on all three or they will not form a cluster and will not say why.
+      RABBITMQ_ERLANG_COOKIE: obs-phase-3-cookie
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - rabbitmq1-data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"    # management UI, guest/guest
+      - "15692:15692"    # prometheus
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    logging: *fluentd-logging
+    mem_limit: 512m
+
+  rabbitmq2:
+    container_name: rabbitmq2
+    <<: *rabbitmq
+    hostname: rabbitmq2
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - rabbitmq2-data:/var/lib/rabbitmq
+    ports: []
+
+  rabbitmq3:
+    container_name: rabbitmq3
+    <<: *rabbitmq
+    hostname: rabbitmq3
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - rabbitmq3-data:/var/lib/rabbitmq
+    ports: []
+
+# ============================================= MinIO — 4-drive erasure set
+# Four nodes, one drive each, one erasure set of four. With EC:2 the set
+# survives losing two of them, which is what makes "kill a drive" a demo and
+# not an outage.
+  minio1: &minio
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio1
+    hostname: minio1
+    command: ["server", "http://minio{1...4}/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Without this every scrape of /minio/v2/metrics/* returns 401 and the
+      # Collector logs it once per interval. The alternative is a bearer token
+      # from `mc admin prometheus generate`.
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - minio1-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *fluentd-logging
+    mem_limit: 512m
+
+  minio2:
+    container_name: minio2
+    <<: *minio
+    hostname: minio2
+    volumes: [minio2-data:/data]
+    ports: []
+
+  minio3:
+    container_name: minio3
+    <<: *minio
+    hostname: minio3
+    volumes: [minio3-data:/data]
+    ports: []
+
+  minio4:
+    container_name: minio4
+    <<: *minio
+    hostname: minio4
+    volumes: [minio4-data:/data]
+    ports: []
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: minio-init
+    entrypoint: >
+      sh -c "mc alias set local http://minio1:9000 minioadmin minioadmin &&
+             mc mb --ignore-existing local/receipts"
+    mem_limit: 64m
+    depends_on:
+      minio1: { condition: service_healthy }
+      minio2: { condition: service_healthy }
+      minio3: { condition: service_healthy }
+      minio4: { condition: service_healthy }
+
+# ===================================================================== pipeline
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.149.0
+    container_name: otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      # Read by resourcedetection's `env` detector. Inside a container the
+      # `system` detector reports the container ID as host.name, which changes
+      # on every restart and silently doubles every series. Say it explicitly.
+      OTEL_RESOURCE_ATTRIBUTES: host.name=laptop
+    # The image runs as uid 10001, which can read neither mongod.log (mode 0600,
+    # owned by the mongodb user) nor a fresh root-owned named volume. Every
+    # log-collecting agent hits this; in phase 5 the DaemonSet Collector runs as
+    # root for exactly the same reason, to read /var/log/pods.
+    user: "0:0"
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      # mongo1's log file, written by mongod, read by the filelog receiver.
+      - mongo1-logs:/var/log/mongodb:ro
+      # filelog remembers how far it read; without this a Collector restart
+      # replays the whole file into Loki.
+      - otelcol-storage:/var/lib/otelcol
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+      - "24224:24224"     # fluentforward
+      - "8888:8888"       # the Collector's own metrics
+    mem_limit: 512m
+    depends_on:
+      tempo: { condition: service_started }
+      loki: { condition: service_started }
+      prometheus: { condition: service_started }
+
+# ================================================== backend, unchanged again
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    mem_limit: 512m
+
+  loki:
+    image: grafana/loki:3.7.7
+    container_name: loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    mem_limit: 512m
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-otlp-receiver"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    mem_limit: 512m
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    container_name: grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    mem_limit: 512m
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+volumes:
+  mongo1-data:
+  mongo2-data:
+  mongo3-data:
+  mongo1-logs:
+  mongo-keyfile:
+  rabbitmq1-data:
+  rabbitmq2-data:
+  rabbitmq3-data:
+  minio1-data:
+  minio2-data:
+  minio3-data:
+  minio4-data:
+  otelcol-storage:
+  tempo-data:
+  loki-data:
+  prometheus-data:

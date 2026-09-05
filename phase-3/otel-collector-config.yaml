@@ -1,0 +1,292 @@
+# Phase 2 had one receiver. This has five, and four of them exist because the
+# three infrastructure systems do not speak OTLP and never will. The Collector
+# is no longer just a pipe: it is a scraper, a log shipper and a translator.
+
+receivers:
+
+  # ---- push: the demo app, unchanged since phase 2 -------------------------
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # ---- pull: the Collector as a Prometheus server --------------------------
+  # scrape_configs is Prometheus's own schema, verbatim. Everything scraped here
+  # is converted to OTLP on the way in, which is why it can share pipelines and
+  # processors with data the app pushed.
+  prometheus:
+    config:
+      scrape_configs:
+
+        # Aggregated broker metrics. Constant cardinality no matter how many
+        # queues exist.
+        - job_name: rabbitmq
+          scrape_interval: 15s
+          static_configs:
+            - targets: [rabbitmq1:15692, rabbitmq2:15692, rabbitmq3:15692]
+
+        # Per-queue metrics live only on /metrics/detailed, and only for the
+        # families you name. Ask for no families and you get nothing; ask for
+        # all of them and you get a series per channel and per connection.
+        # Naming three families is the cardinality decision, made at the scrape.
+        - job_name: rabbitmq-detailed
+          scrape_interval: 15s
+          metrics_path: /metrics/detailed
+          params:
+            family:
+              - queue_coarse_metrics       # messages ready / unacked / total
+              - queue_consumer_count
+              - queue_metrics              # durability, type, state
+          static_configs:
+            - targets: [rabbitmq1:15692, rabbitmq2:15692, rabbitmq3:15692]
+
+        # Cluster-wide MinIO state is identical from every node, so scrape one.
+        - job_name: minio-cluster
+          scrape_interval: 15s
+          metrics_path: /minio/v2/metrics/cluster
+          static_configs:
+            - targets: [minio1:9000]
+
+        # Per-node state is not, so scrape all four.
+        - job_name: minio-node
+          scrape_interval: 15s
+          metrics_path: /minio/v2/metrics/node
+          static_configs:
+            - targets: [minio1:9000, minio2:9000, minio3:9000, minio4:9000]
+
+        # Percona's exporter. One instance for the whole set: replSetGetStatus
+        # from the primary describes every member.
+        - job_name: mongodb-exporter
+          scrape_interval: 15s
+          static_configs:
+            - targets: [mongodb-exporter:9216]
+
+        # The pipeline observing itself. Phase 6 builds alerts on these.
+        - job_name: otelcol
+          scrape_interval: 15s
+          static_configs:
+            - targets: [localhost:8888]
+
+  # ---- pull: a purpose-built receiver --------------------------------------
+  # Speaks the Mongo wire protocol and runs serverStatus/dbStats itself. Cleaner
+  # names and real OTel semantic conventions, but a fixed metric set: no
+  # replication lag, no oplog window. Hence the exporter above as well.
+  mongodb:
+    hosts:
+      - endpoint: mongo1:27017
+      - endpoint: mongo2:27017
+      - endpoint: mongo3:27017
+    username: otel
+    password: otelpw
+    collection_interval: 30s
+    tls:
+      insecure: true
+
+  # ---- logs: the Docker logging driver -------------------------------------
+  # /var/lib/docker/containers is inside the VM on macOS, so it cannot be
+  # bind-mounted. The fluentd driver pushes instead, which works the same on
+  # Linux and needs no host paths at all.
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+
+  # ---- logs: tailing a file ------------------------------------------------
+  # Only mongo1 is collected this way, purely to have filelog in the build
+  # before phase 5, where /var/log/pods/*/*/*.log is the only option.
+  file_log/mongodb:
+    include: [/var/log/mongodb/mongod.log]
+    start_at: end
+    storage: file_storage        # survive a Collector restart without replaying
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes["t"]["$$date"]
+          layout: "%Y-%m-%dT%H:%M:%S.%L%j"
+        severity:
+          parse_from: attributes.s
+          mapping:
+            debug: D1
+            info: I
+            warn: W
+            error: [E, F]
+      - type: move
+        from: attributes.msg
+        to: body
+      # filelog knows nothing about who wrote the file. Say so explicitly, or
+      # these lines arrive in Loki with no service_name at all.
+      - type: add
+        field: resource["service.name"]
+        value: mongodb
+      - type: add
+        field: resource["service.instance.id"]
+        value: mongo1:27017
+
+processors:
+
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  # host.name on everything, from OTEL_RESOURCE_ATTRIBUTES on the Collector.
+  # Deliberately not the `system` detector: see the note in docker-compose.yaml.
+  resourcedetection:
+    detectors: [env]
+
+  # One system, one service.name. The prometheus receiver sets service.name from
+  # the job, so rabbitmq and rabbitmq-detailed would otherwise be two services,
+  # and minio-cluster and minio-node another two.
+  transform/normalise-infra:
+    error_mode: ignore
+    metric_statements:
+      - set(resource.attributes["service.name"], "rabbitmq")
+          where IsMatch(resource.attributes["service.name"], "^rabbitmq")
+      - set(resource.attributes["service.name"], "minio")
+          where IsMatch(resource.attributes["service.name"], "^minio")
+      - set(resource.attributes["service.name"], "mongodb")
+          where resource.attributes["service.name"] == "mongodb-exporter"
+      # The mongodb receiver identifies itself by host and port only.
+      - set(resource.attributes["service.name"], "mongodb")
+          where resource.attributes["service.name"] == nil
+              and resource.attributes["server.address"] != nil
+      # The mongodb receiver reports one resource for the whole set, identified
+      # by the first seed host and no port. Without this the Prometheus OTLP
+      # receiver invents a UUID for `instance`, which is unreadable and changes.
+      - set(resource.attributes["service.instance.id"], resource.attributes["server.address"])
+          where resource.attributes["service.instance.id"] == nil
+              and resource.attributes["server.address"] != nil
+
+  # Same job for logs. fluent.tag is the container name and nothing else knows
+  # which system it came from.
+  transform/normalise-logs:
+    error_mode: ignore
+    log_statements:
+      - set(resource.attributes["service.instance.id"], log.attributes["fluent.tag"])
+          where log.attributes["fluent.tag"] != nil
+      - set(resource.attributes["service.name"], "rabbitmq")
+          where IsMatch(log.attributes["fluent.tag"], "^rabbitmq")
+      - set(resource.attributes["service.name"], "minio")
+          where IsMatch(log.attributes["fluent.tag"], "^minio")
+      - set(resource.attributes["service.name"], "mongodb")
+          where IsMatch(log.attributes["fluent.tag"], "^mongo")
+      # The Docker driver sends one record per line with the stream on it.
+      - set(log.attributes["log.iostream"], log.attributes["source"])
+          where log.attributes["source"] != nil
+      - delete_key(log.attributes, "source")
+      - delete_key(log.attributes, "container_id")
+      - delete_key(log.attributes, "container_name")
+
+  # Cardinality, dropped at the pipe. Everything here is real telemetry that is
+  # simply not on any dashboard, and storing it costs the same as storing the
+  # telemetry that is. Measured effect is in the README.
+  filter/cardinality:
+    error_mode: ignore
+    metrics:
+      metric:
+        # Exporter and server self-metrics: Go runtime, HTTP handler, process.
+        # 44 series from the Mongo exporter, 35 from each MinIO node.
+        - 'IsMatch(name, "^(go_|promhttp_|process_)")'
+        # Erlang VM internals: one series per scheduler, per allocator type,
+        # per memory carrier, times three brokers. Useful when debugging the
+        # broker itself, noise the other 99% of the time.
+        - 'IsMatch(name, "^erlang_vm_(allocators|msacc|dist|atom|ets_tables)")'
+        # One series per MongoDB command name, whether or not it was ever
+        # issued. 862 series on this idle-ish replica set.
+        - 'IsMatch(name, "^mongodb_ss_metrics_commands_")'
+        # WiredTiger internals: 1169 series, of which three are on a dashboard.
+        - 'IsMatch(name, "^mongodb_ss_wt_") and not IsMatch(name, "^mongodb_ss_wt_cache_(bytes_currently_in_the_cache|tracked_dirty_bytes_in_the_cache|maximum_bytes_configured)$")'
+        # Per-collection operation timings from `top`. 18 metrics x every
+        # collection MongoDB has, system collections included: 450 series on a
+        # database with one application collection in it.
+        - 'IsMatch(name, "^mongodb_top_")'
+        # WiredTiger storage internals of the oplog collection (324) and of the
+        # internal config.image_collection (631). The oplog numbers that matter
+        # are mongodb_mongod_replset_oplog_{head,tail}_timestamp, which stay.
+        - 'IsMatch(name, "^mongodb_oplog_stats_")'
+        - 'IsMatch(name, "_collection_stats_")'
+        # Host CPU, memory and disk read out of /proc by the exporter. That is
+        # hostmetrics' job, and on Kubernetes it is kubeletstats' job.
+        - 'IsMatch(name, "^mongodb_sys_")'
+        # Per-drive, per-storage-API latency: 7 storage APIs x 4 nodes.
+        - 'IsMatch(name, "^minio_node_drive_latency_us$")'
+
+  batch:
+    timeout: 1s
+
+connectors:
+  servicegraph:
+    latency_histogram_buckets: [0.1s, 0.25s, 0.5s, 1s, 2s, 5s]
+    store:
+      ttl: 30s
+      max_items: 10000
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 60s
+
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  otlp_http/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+    tls:
+      insecure: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  file_storage:
+    directory: /var/lib/otelcol
+
+service:
+  extensions: [health_check, file_storage]
+  pipelines:
+
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [otlp_grpc/tempo, servicegraph]
+
+    # Application metrics: pushed, already correctly attributed, nothing to fix.
+    metrics/app:
+      receivers:  [otlp, servicegraph]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [otlp_http/prometheus]
+
+    # Infrastructure metrics: scraped, badly attributed, far too many of them.
+    # Two pipelines rather than one because the processing differs, not because
+    # the destination does.
+    metrics/infra:
+      receivers:  [prometheus, mongodb]
+      processors: [memory_limiter, resourcedetection, transform/normalise-infra, filter/cardinality, batch]
+      exporters:  [otlp_http/prometheus]
+
+    logs:
+      receivers:  [otlp, fluentforward, file_log/mongodb]
+      processors: [memory_limiter, resourcedetection, transform/normalise-logs, batch]
+      exporters:  [otlp_http/loki]
+
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+    logs:
+      level: info

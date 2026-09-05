@@ -13,19 +13,25 @@ starting any phase.
 
 ## Contents
 
-- [The premise](#the-premise)
-- [Stack decisions and why](#stack-decisions-and-why)
-- [Hardware budget](#hardware-budget)
-- [Conventions](#conventions)
-- [Definition of done](#definition-of-done)
-- [Phase 0 — Signals, OTLP, the Collector](#phase-0--signals-otlp-the-collector) ✅ done
-- [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm) ✅ done
-- [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq) ✅ done
-- [Phase 3 — Infrastructure signals](#phase-3--infrastructure-signals)
-- [Phase 4 — Swap in Elasticsearch and Kibana](#phase-4--swap-in-elasticsearch-and-kibana)
-- [Phase 5 — Kubernetes on k3d](#phase-5--kubernetes-on-k3d)
-- [Phase 6 — Production concerns](#phase-6--production-concerns)
-- [Reference: the gotcha list](#reference-the-gotcha-list)
+- [Observability with OpenTelemetry — full build plan](#observability-with-opentelemetry--full-build-plan)
+  - [Contents](#contents)
+  - [The premise](#the-premise)
+  - [Stack decisions and why](#stack-decisions-and-why)
+  - [Hardware budget](#hardware-budget)
+  - [Conventions](#conventions)
+    - [Repository layout](#repository-layout)
+    - [Version pinning](#version-pinning)
+    - [Collector config style](#collector-config-style)
+    - [Explainer HTML](#explainer-html)
+  - [Definition of done](#definition-of-done)
+  - [Phase 0 — Signals, OTLP, the Collector](#phase-0--signals-otlp-the-collector)
+  - [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm)
+  - [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq)
+  - [Phase 3 — Infrastructure signals](#phase-3--infrastructure-signals)
+  - [Phase 4 — Swap in Elasticsearch and Kibana](#phase-4--swap-in-elasticsearch-and-kibana)
+  - [Phase 5 — Kubernetes on k3d](#phase-5--kubernetes-on-k3d)
+  - [Phase 6 — Production concerns](#phase-6--production-concerns)
+  - [Reference: the gotcha list](#reference-the-gotcha-list)
 
 ---
 
@@ -52,11 +58,11 @@ exporter config and zero application changes. Phase 4 exists to prove that.
 **2. MongoDB, RabbitMQ and MinIO do not speak OTLP and never will.** They expose
 native formats and the Collector's job is to fetch and translate:
 
-| System | Metrics | Logs | Traces |
-|---|---|---|---|
-| MongoDB | `serverStatus` / `replSetGetStatus` via the `mongodb` receiver; Percona `mongodb_exporter` for replica-set detail | structured JSON on stdout | **none** |
-| RabbitMQ | `rabbitmq_prometheus` plugin on `:15692` (native, excellent) | stdout | **none** |
-| MinIO | `/minio/v2/metrics/{cluster,node,bucket,resource}` | stdout + audit-event webhook | **none** |
+| System   | Metrics                                                                                                           | Logs                         | Traces   |
+| -------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------- | -------- |
+| MongoDB  | `serverStatus` / `replSetGetStatus` via the `mongodb` receiver; Percona `mongodb_exporter` for replica-set detail | structured JSON on stdout    | **none** |
+| RabbitMQ | `rabbitmq_prometheus` plugin on `:15692` (native, excellent)                                                      | stdout                       | **none** |
+| MinIO    | `/minio/v2/metrics/{cluster,node,bucket,resource}`                                                                | stdout + audit-event webhook | **none** |
 
 **3. Traces exist only because we write an application.** Spans for these three
 systems are emitted by the *client libraries* inside the demo app
@@ -67,15 +73,15 @@ demo app the project is a metrics-and-logs exercise. The app is not optional.
 
 ## Stack decisions and why
 
-| Choice | Decision | Rationale |
-|---|---|---|
-| Collector distribution | `otel/opentelemetry-collector-contrib` | Every receiver we need (`prometheus`, `filelog`, `mongodb`, `rabbitmq`, `k8sattributes`, `fluentforward`) is contrib-only. The `core` image will fail with `unknown type`. |
-| Backend A | Grafana + Prometheus/Mimir + Loki + Tempo | Lighter than Elastic. Its three query languages force you to learn what actually distinguishes the three signals. |
-| Backend B | Elasticsearch + Kibana | One engine for all signals, search-first model. Ships in Phase 4 so the comparison is grounded in real use, not a feature matrix. |
-| Demo app | Spring Boot 3.5 on Java 21 | Instrumented by the OTel Java agent, which covers Tomcat, Spring AMQP, the AMQP client, the Mongo driver, OkHttp and Logback — the whole path — with no code change and no OTel dependency for tracing. |
-| Local runtime, phases 0–4 | Docker Compose | Kubernetes adds a second learning axis (operators, CRDs, RBAC, DaemonSets) that obscures the OTEL concepts. |
-| Local runtime, phase 5 | **k3d** | ~500 MB overhead vs ~1 GB for kind and ~2 GB for minikube. Ships Traefik and a LoadBalancer so `http://grafana.localhost` works with no port-forward. Diverges slightly from upstream (sqlite instead of etcd) — irrelevant here. |
-| Container runtime | OrbStack recommended over Docker Desktop | Roughly half the idle RAM, faster disk, same CLI. On 16 GB this is not cosmetic. |
+| Choice                    | Decision                                  | Rationale                                                                                                                                                                                                                         |
+| ------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Collector distribution    | `otel/opentelemetry-collector-contrib`    | Every receiver we need (`prometheus`, `filelog`, `mongodb`, `rabbitmq`, `k8sattributes`, `fluentforward`) is contrib-only. The `core` image will fail with `unknown type`.                                                        |
+| Backend A                 | Grafana + Prometheus/Mimir + Loki + Tempo | Lighter than Elastic. Its three query languages force you to learn what actually distinguishes the three signals.                                                                                                                 |
+| Backend B                 | Elasticsearch + Kibana                    | One engine for all signals, search-first model. Ships in Phase 4 so the comparison is grounded in real use, not a feature matrix.                                                                                                 |
+| Demo app                  | Spring Boot 3.5 on Java 21                | Instrumented by the OTel Java agent, which covers Tomcat, Spring AMQP, the AMQP client, the Mongo driver, OkHttp and Logback — the whole path — with no code change and no OTel dependency for tracing.                           |
+| Local runtime, phases 0–4 | Docker Compose                            | Kubernetes adds a second learning axis (operators, CRDs, RBAC, DaemonSets) that obscures the OTEL concepts.                                                                                                                       |
+| Local runtime, phase 5    | **k3d**                                   | ~500 MB overhead vs ~1 GB for kind and ~2 GB for minikube. Ships Traefik and a LoadBalancer so `http://grafana.localhost` works with no port-forward. Diverges slightly from upstream (sqlite instead of etcd) — irrelevant here. |
+| Container runtime         | OrbStack recommended over Docker Desktop  | Roughly half the idle RAM, faster disk, same CLI. On 16 GB this is not cosmetic.                                                                                                                                                  |
 
 ---
 
@@ -84,16 +90,16 @@ demo app the project is a metrics-and-logs exercise. The app is not optional.
 Target machine: **Apple Silicon MacBook, 16 GB RAM, 8 cores.** This is the
 binding constraint on the whole project.
 
-| Component | Approx RSS |
-|---|---|
-| MongoDB replica set, 3 nodes | 1.5 GB |
-| RabbitMQ cluster, 3 nodes | 1.5 GB |
-| MinIO, 4 drives | 2.0 GB |
-| Demo app (api + worker) | 0.4 GB |
-| Collector | 0.3 GB |
-| Grafana + Prometheus + Loki + Tempo | 2.0 GB |
-| Elasticsearch + Kibana | 3.0 GB |
-| k3s control plane (phase 5) | 0.5 GB |
+| Component                           | Approx RSS |
+| ----------------------------------- | ---------- |
+| MongoDB replica set, 3 nodes        | 1.5 GB     |
+| RabbitMQ cluster, 3 nodes           | 1.5 GB     |
+| MinIO, 4 drives                     | 2.0 GB     |
+| Demo app (api + worker)             | 0.4 GB     |
+| Collector                           | 0.3 GB     |
+| Grafana + Prometheus + Loki + Tempo | 2.0 GB     |
+| Elasticsearch + Kibana              | 3.0 GB     |
+| k3s control plane (phase 5)         | 0.5 GB     |
 
 **Rules that follow from this:**
 
@@ -164,15 +170,15 @@ local asset references.
 
 Established design system — reuse it exactly, do not reinvent per phase:
 
-| | |
-|---|---|
-| Fonts | Instrument Serif (display), IBM Plex Sans (body), IBM Plex Mono (code/labels), loaded from Google Fonts |
-| Signal colours | metrics `--metric` blue, logs `--log` green, traces `--trace` violet — used consistently in every diagram across every phase |
-| Structural colour | `--struct` indigo for OTEL-owned components |
-| Warning colour | `--warn` for the thing that will bite you |
-| Neutrals | cool-grey paper with a slight blue bias, not pure grey |
-| Themes | full light and dark token sets; declare every token on bare `:root`, redefine under `@media (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`, and again under `:root[data-theme="dark"]` |
-| Diagrams | hand-authored inline SVG, `viewBox` sized to content, colours via `var(--token)`, labelled arrows, `role="img"` + `aria-label`, wrapped in `<figure>` with a `<figcaption>` that states the claim |
+|                   |                                                                                                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fonts             | Instrument Serif (display), IBM Plex Sans (body), IBM Plex Mono (code/labels), loaded from Google Fonts                                                                                                            |
+| Signal colours    | metrics `--metric` blue, logs `--log` green, traces `--trace` violet — used consistently in every diagram across every phase                                                                                       |
+| Structural colour | `--struct` indigo for OTEL-owned components                                                                                                                                                                        |
+| Warning colour    | `--warn` for the thing that will bite you                                                                                                                                                                          |
+| Neutrals          | cool-grey paper with a slight blue bias, not pure grey                                                                                                                                                             |
+| Themes            | full light and dark token sets; declare every token on bare `:root`, redefine under `@media (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`, and again under `:root[data-theme="dark"]` |
+| Diagrams          | hand-authored inline SVG, `viewBox` sized to content, colours via `var(--token)`, labelled arrows, `role="img"` + `aria-label`, wrapped in `<figure>` with a `<figcaption>` that states the claim                  |
 
 Copy the `<style>` block from `docs/phase-0-signals-and-collector.html` verbatim.
 
@@ -258,12 +264,12 @@ changing nothing else. Prove the seam.
 
 **Components.**
 
-| Service | Role | Note |
-|---|---|---|
-| Tempo | traces | Native OTLP receiver on 4317. Needs `tempo.yaml` with a `local` storage backend. |
-| Loki | logs | Native OTLP endpoint. Single-binary mode, filesystem storage. |
+| Service    | Role    | Note                                                                                                                                      |
+| ---------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Tempo      | traces  | Native OTLP receiver on 4317. Needs `tempo.yaml` with a `local` storage backend.                                                          |
+| Loki       | logs    | Native OTLP endpoint. Single-binary mode, filesystem storage.                                                                             |
 | Prometheus | metrics | Run with `--web.enable-otlp-receiver` and ingest OTLP directly at `/api/v1/otlp/v1/metrics`. Simpler and much lighter than Mimir locally. |
-| Grafana | UI | Datasources provisioned from `grafana/provisioning/datasources/*.yaml`. |
+| Grafana    | UI      | Datasources provisioned from `grafana/provisioning/datasources/*.yaml`.                                                                   |
 
 Mimir is the horizontally-scalable replacement for Prometheus. Note the
 difference in the explainer; do not run it locally — Prometheus is enough and
@@ -375,11 +381,11 @@ One jar runs as both: `SPRING_PROFILES_ACTIVE` selects the half,
 **Instrumentation choice.** Three paths exist for Spring Boot, and they are not
 interchangeable:
 
-| | owner | wiring | coverage |
-|---|---|---|---|
-| **OTel Java agent** ← *this phase* | OpenTelemetry | `-javaagent:` flag | ~130 libraries |
-| OTel Spring Boot starter | OpenTelemetry | one dependency | narrower; works with native image |
-| Micrometer + `micrometer-tracing-bridge-otel` | **Spring** | dependency + `management.*` properties | only what Spring instruments |
+|                                               | owner         | wiring                                 | coverage                          |
+| --------------------------------------------- | ------------- | -------------------------------------- | --------------------------------- |
+| **OTel Java agent** ← *this phase*            | OpenTelemetry | `-javaagent:` flag                     | ~130 libraries                    |
+| OTel Spring Boot starter                      | OpenTelemetry | one dependency                         | narrower; works with native image |
+| Micrometer + `micrometer-tracing-bridge-otel` | **Spring**    | dependency + `management.*` properties | only what Spring instruments      |
 
 OpenTelemetry recommends the agent and treats the starter as the fallback for
 when an agent cannot run. Spring recommends neither, and points at Micrometer
@@ -487,6 +493,8 @@ trace on the CONSUMER span.
 
 ## Phase 3 — Infrastructure signals
 
+**Status: complete.** `docs/phase-3-infrastructure-signals.html`, `phase-3/`.
+
 **Objective.** Observe the three real systems. This is the phase the whole
 project exists for.
 
@@ -511,12 +519,12 @@ erasure set**.
 
 **Metric sources.**
 
-| System | How | Requires |
-|---|---|---|
-| MongoDB, basics | `mongodb` receiver | a user with the `clusterMonitor` role |
-| MongoDB, replica set detail | `prometheus` receiver scraping Percona `mongodb_exporter` | `--collect-all --compatible-mode` |
-| RabbitMQ | `prometheus` receiver scraping `:15692/metrics` and `/metrics/detailed` | `rabbitmq_prometheus` plugin enabled |
-| MinIO | `prometheus` receiver scraping `/minio/v2/metrics/cluster` and `/node` | see auth gotcha below |
+| System                      | How                                                                     | Requires                              |
+| --------------------------- | ----------------------------------------------------------------------- | ------------------------------------- |
+| MongoDB, basics             | `mongodb` receiver                                                      | a user with the `clusterMonitor` role |
+| MongoDB, replica set detail | `prometheus` receiver scraping Percona `mongodb_exporter`               | `--collect-all --compatible-mode`     |
+| RabbitMQ                    | `prometheus` receiver scraping `:15692/metrics` and `/metrics/detailed` | `rabbitmq_prometheus` plugin enabled  |
+| MinIO                       | `prometheus` receiver scraping `/minio/v2/metrics/cluster` and `/node`  | see auth gotcha below                 |
 
 The built-in `mongodb` receiver does not expose replication lag or oplog window.
 Those are the two metrics that matter most for a replica set, which is why the
@@ -570,12 +578,12 @@ correlation.
 
 **Breaks — these are the real exercise.**
 
-| Do this | Observe |
-|---|---|
-| `docker kill` the MongoDB primary | election in the metrics, a new primary, lag spike on the returning node, oplog catch-up |
-| Stop the worker, keep traffic running | RabbitMQ `messages_ready` climbs, consumer count drops to zero, memory alarm eventually |
-| `docker kill` one MinIO drive container | drives-offline metric, cluster stays readable, healing starts on return |
-| Add `user_id` as a metric label in the app | watch series count climb in Prometheus `/status` — the Phase 0 lesson, in production |
+| Do this                                    | Observe                                                                                 |
+| ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `docker kill` the MongoDB primary          | election in the metrics, a new primary, lag spike on the returning node, oplog catch-up |
+| Stop the worker, keep traffic running      | RabbitMQ `messages_ready` climbs, consumer count drops to zero, memory alarm eventually |
+| `docker kill` one MinIO drive container    | drives-offline metric, cluster stays readable, healing starts on return                 |
+| Add `user_id` as a metric label in the app | watch series count climb in Prometheus `/status` — the Phase 0 lesson, in production    |
 
 ---
 
@@ -621,15 +629,15 @@ system only — the RAM will not take more.
 
 **Comparison to fill in with measurements, not opinions.**
 
-| Dimension | Measure it by |
-|---|---|
-| Storage footprint | `GET _cat/indices?v` bytes vs `du -sh` on the Loki and Tempo volumes, same ingest |
-| Memory | `docker stats` steady-state RSS for each stack |
-| Query ergonomics | write the same three questions in PromQL/LogQL/TraceQL and in ES\|QL/KQL, time yourself |
-| Correlation UX | trace → logs and log → trace, click count in each UI |
-| Ad-hoc search | "find every occurrence of this stack trace in the last 24h" — Loki without a matching label vs Elasticsearch |
-| Alerting | build one identical alert in both |
-| Cost model | index-everything vs index-labels-only, and what that means at 100× the volume |
+| Dimension         | Measure it by                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| Storage footprint | `GET _cat/indices?v` bytes vs `du -sh` on the Loki and Tempo volumes, same ingest                            |
+| Memory            | `docker stats` steady-state RSS for each stack                                                               |
+| Query ergonomics  | write the same three questions in PromQL/LogQL/TraceQL and in ES\|QL/KQL, time yourself                      |
+| Correlation UX    | trace → logs and log → trace, click count in each UI                                                         |
+| Ad-hoc search     | "find every occurrence of this stack trace in the last 24h" — Loki without a matching label vs Elasticsearch |
+| Alerting          | build one identical alert in both                                                                            |
+| Cost model        | index-everything vs index-labels-only, and what that means at 100× the volume                                |
 
 Expect the honest answer to be: Elastic wins ad-hoc search decisively, Grafana
 wins metrics ergonomics and cost decisively, and correlation is roughly a tie.
@@ -672,9 +680,9 @@ registry.
   Deployment Collector that does cluster-wide work (enrichment, tail sampling,
   export). Draw this; it is the single most important diagram of the phase.
 - The **OpenTelemetry Operator** (`OpenTelemetryCollector` and `Instrumentation`
-  CRDs, auto-instrumentation by pod annotation) versus the plain Helm chart.
-  The Operator needs cert-manager. Show the Operator, but be explicit that the
-  Helm chart alone is a legitimate choice.
+  CRDs, auto-instrumentation by pod annotation — see the injection step below)
+  versus the plain Helm chart. The Operator needs cert-manager. Show the
+  Operator, but be explicit that the Helm chart alone is a legitimate choice.
 - `k8sattributes` processor — how pod IP to pod metadata lookup works, the RBAC
   it needs, and why every signal should carry `k8s.namespace.name`,
   `k8s.pod.name`, `k8s.deployment.name`
@@ -682,6 +690,100 @@ registry.
 - `kubeletstats` receiver for pod and container resource metrics
 - The Target Allocator, and how Prometheus `ServiceMonitor` CRDs get discovered
   and sharded across Collector replicas
+
+**Step: re-instrument the demo app by injection, not by image.** Phase 2 baked
+`-javaagent:` into the container's entrypoint. Undo that here and let the
+Operator do it, so the same jar is instrumented by cluster configuration alone.
+
+The mechanism is a **mutating admission webhook**. On pod creation the Operator
+rewrites the pod spec before the scheduler ever sees it:
+
+```
+Deployment applied
+      │
+      ▼  API server calls the OTel mutating webhook
+Operator mutates the pod spec
+      ├── adds an initContainer holding opentelemetry-javaagent.jar
+      ├── adds an emptyDir volume shared by initContainer and app container
+      ├── sets JAVA_TOOL_OPTIONS=-javaagent:/otel-auto-instrumentation/javaagent.jar
+      └── sets OTEL_* env vars from the Instrumentation resource
+      │
+      ▼
+App container starts — the JVM reads JAVA_TOOL_OPTIONS and attaches the agent
+```
+
+The initContainer's only job is to copy the agent jar onto the shared volume.
+Nothing in the application image changes.
+
+Two objects are involved. An `Instrumentation` CR holds the defaults —
+agent image, exporter endpoint, propagators, sampler:
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: java-agent
+  namespace: demo
+spec:
+  exporter:
+    endpoint: http://otel-gateway-collector.observability.svc.cluster.local:4318
+  propagators: [tracecontext, baggage]
+  sampler:
+    type: parentbased_always_on
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:<pinned>
+    env:
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+```
+
+And an annotation on the pod template opts a workload in:
+
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        instrumentation.opentelemetry.io/inject-java: "java-agent"
+        resource.opentelemetry.io/service.name: "order-api"
+```
+
+The annotation value is not a boolean in disguise. `"true"` means *an
+`Instrumentation` named `default` in this namespace*; a bare name means that CR
+in this namespace; `namespace/name` reaches across namespaces; `"false"` opts a
+single pod out. The same annotation works on a `Namespace` object, which
+instruments every pod in it — that is how this is used at scale, and it is
+worth doing once to see it.
+
+Point the exporter at the **DaemonSet agent** Collector, not the gateway, once
+that tier exists — the injected endpoint is the one place the two-tier topology
+becomes concrete for the application.
+
+**Gotchas.**
+
+- The webhook only fires at pod *creation*. Applying the `Instrumentation` CR
+  changes nothing until pods are recreated. `kubectl rollout restart`.
+- The annotation belongs on `spec.template.metadata.annotations`, not on the
+  Deployment's own metadata. Putting it in the wrong place silently does
+  nothing — no error, no injection. Diagnose it with
+  `kubectl get pod -o yaml` and look for the initContainer.
+- If the image's entrypoint already sets `JAVA_TOOL_OPTIONS`, the injected
+  value is appended to it; two `-javaagent` flags for the same agent will fail
+  at startup. Remove Phase 2's flag.
+- `service.name` resolution order matters: `OTEL_SERVICE_NAME` in the container
+  beats the `resource.opentelemetry.io/service.name` annotation, which beats
+  the Operator's fallback of `<deployment name>`. Getting `order-worker` and
+  `order-api` to stay distinct is the test.
+- **Not usable with GraalVM native images.** A native executable is not a JVM;
+  it ignores `JAVA_TOOL_OPTIONS` and cannot load a `-javaagent`. That path needs
+  the `opentelemetry-spring-boot-starter` compiled in — the Phase 2 table's
+  second row, and the concrete reason it exists.
+
+**Verification.** Traces for `order-api` and `order-worker` appear in Tempo
+with the same shape as Phase 2, from an image containing no OpenTelemetry code.
+`kubectl get pod <api-pod> -o jsonpath='{.spec.initContainers[*].name}'` shows
+`opentelemetry-auto-instrumentation-java`. Deleting the annotation and
+restarting makes the traces stop.
 
 **Workloads.** Use operators or charts that produce genuine HA topologies:
 MongoDB Community Operator or a Bitnami chart in replica-set mode, the RabbitMQ

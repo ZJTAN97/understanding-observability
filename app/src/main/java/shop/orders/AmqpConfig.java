@@ -3,6 +3,7 @@ package shop.orders;
 import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
 import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
 import org.springframework.amqp.core.TopicExchange;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
@@ -19,9 +20,13 @@ class AmqpConfig {
     return new TopicExchange(cfg.exchange(), true, false);
   }
 
+  // A quorum queue is replicated by Raft across the cluster; a classic queue
+  // lives on one node and dies with it. The type is fixed at declaration time
+  // and cannot be changed afterwards, so switching it needs a fresh broker.
   @Bean
   Queue ordersQueue(AppProperties cfg) {
-    return new Queue(cfg.queue(), true);
+    QueueBuilder b = QueueBuilder.durable(cfg.queue());
+    return "quorum".equals(cfg.queueType()) ? b.quorum().build() : b.build();
   }
 
   @Bean
