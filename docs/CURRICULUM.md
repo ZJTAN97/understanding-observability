@@ -1,8 +1,26 @@
 # Observability with OpenTelemetry — full build plan
 
-A six-phase, self-hosted curriculum that ends with a MongoDB replica set, an HA
-RabbitMQ cluster and MinIO fully observed on Kubernetes, with the same telemetry
-pipeline pointed at both Grafana and Elastic for comparison.
+An eight-phase, self-hosted curriculum that ends with a Spring Boot application
+on Kubernetes — auto-instrumented by the OpenTelemetry Operator — plus a
+RabbitMQ cluster in-cluster and a MongoDB replica set and MinIO deliberately
+*outside* the cluster, all observed in Elasticsearch and Kibana.
+
+**Elastic is the destination.** Phases 1–3 build the same pipeline against
+Grafana first, because its three query languages force you to learn what
+actually distinguishes the three signals — a lesson Elastic's one-engine model
+hides. Phase 4 repoints the pipeline at Elastic and keeps it there.
+
+The target environment being mirrored, from Phase 5 onwards:
+
+| | |
+|---|---|
+| Kubernetes | Spring Boot services, instrumented by `instrumentation.opentelemetry.io/inject-java` — no code and no image change |
+| Kubernetes | RabbitMQ as a Helm chart |
+| Outside the cluster | MongoDB and MinIO on their own machines |
+| Backend | Elasticsearch with Kibana APM / Observability |
+
+Phase 7 ends with three documents a colleague can follow without reading this
+file. That is the actual point of the project.
 
 This file is the spec. It is written to be handed to another agent (or another
 person) who has not seen the conversation that produced it. Read
@@ -28,16 +46,17 @@ starting any phase.
   - [Phase 1 — A real backend: Grafana LGTM](#phase-1--a-real-backend-grafana-lgtm)
   - [Phase 2 — Instrument the app, propagate through RabbitMQ](#phase-2--instrument-the-app-propagate-through-rabbitmq)
   - [Phase 3 — Infrastructure signals](#phase-3--infrastructure-signals)
-  - [Phase 4 — Swap in Elasticsearch and Kibana](#phase-4--swap-in-elasticsearch-and-kibana)
-  - [Phase 5 — Kubernetes on k3d](#phase-5--kubernetes-on-k3d)
-  - [Phase 6 — Production concerns](#phase-6--production-concerns)
+  - [Phase 4 — Elastic as the destination](#phase-4--elastic-as-the-destination)
+  - [Phase 5 — Kubernetes and the OpenTelemetry Operator](#phase-5--kubernetes-and-the-opentelemetry-operator)
+  - [Phase 6 — The hybrid boundary: infrastructure outside the cluster](#phase-6--the-hybrid-boundary-infrastructure-outside-the-cluster)
+  - [Phase 7 — Production concerns and team practices](#phase-7--production-concerns-and-team-practices)
   - [Reference: the gotcha list](#reference-the-gotcha-list)
 
 ---
 
 ## The premise
 
-Three facts shape everything below. An agent that misses these will build the
+Four facts shape everything below. An agent that misses these will build the
 wrong thing.
 
 **1. OpenTelemetry is instrumentation plus a wire protocol plus a pipe. It is not
@@ -53,7 +72,8 @@ Query & visualise Grafana                           —or—  Kibana
 ```
 
 Because OTLP is the seam, swapping the bottom two layers costs a few lines of
-exporter config and zero application changes. Phase 4 exists to prove that.
+exporter config and zero application changes. Phase 4 proves that by moving from
+Grafana to Elastic without touching the application or a single receiver.
 
 **2. MongoDB, RabbitMQ and MinIO do not speak OTLP and never will.** They expose
 native formats and the Collector's job is to fetch and translate:
@@ -65,9 +85,19 @@ native formats and the Collector's job is to fetch and translate:
 | MinIO    | `/minio/v2/metrics/{cluster,node,bucket,resource}`                                                                | stdout + audit-event webhook | **none** |
 
 **3. Traces exist only because we write an application.** Spans for these three
-systems are emitted by the *client libraries* inside the demo app
-(`mongodb`, `amqplib`, `@aws-sdk/client-s3`), never by the servers. Without the
-demo app the project is a metrics-and-logs exercise. The app is not optional.
+systems are emitted by the *client libraries* inside the demo app — the MongoDB
+Java driver, Spring AMQP, the AWS SDK v2 S3 client — never by the servers.
+Without the demo app the project is a metrics-and-logs exercise. The app is not
+optional.
+
+**4. The estate spans an administrative boundary, and that is deliberate.** From
+Phase 5 the application and RabbitMQ run on Kubernetes; from Phase 6 MongoDB and
+MinIO run outside it. Half the telemetry therefore has no `k8s.*` identity, is
+not discoverable by Kubernetes service discovery, and belongs to credentials
+someone else owns. Every published tutorial assumes a single-world cluster.
+Phase 6 exists because the real environment is not one, and an agent that
+quietly moves Mongo and MinIO into the cluster has deleted the hardest and most
+valuable phase.
 
 ---
 
@@ -76,11 +106,14 @@ demo app the project is a metrics-and-logs exercise. The app is not optional.
 | Choice                    | Decision                                  | Rationale                                                                                                                                                                                                                         |
 | ------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Collector distribution    | `otel/opentelemetry-collector-contrib`    | Every receiver we need (`prometheus`, `filelog`, `mongodb`, `rabbitmq`, `k8sattributes`, `fluentforward`) is contrib-only. The `core` image will fail with `unknown type`.                                                        |
-| Backend A                 | Grafana + Prometheus/Mimir + Loki + Tempo | Lighter than Elastic. Its three query languages force you to learn what actually distinguishes the three signals.                                                                                                                 |
-| Backend B                 | Elasticsearch + Kibana                    | One engine for all signals, search-first model. Ships in Phase 4 so the comparison is grounded in real use, not a feature matrix.                                                                                                 |
+| Teaching backend, phases 1–3 | Grafana + Prometheus/Mimir + Loki + Tempo | Lighter than Elastic. Its three query languages force you to learn what actually distinguishes the three signals — which is precisely what a single search engine lets you skip. A scaffold, removed in Phase 4.              |
+| **Destination backend, phases 4–7** | **Elasticsearch + Kibana**       | The backend the target environment runs. One engine for all signals, search-first, with APM as the trace UI. Everything from Phase 4 on assumes it.                                                                             |
+| Route into Elastic       | contrib Collector, `elasticsearch` exporter | Keeps one pipeline shape across both backends, which is what makes the seam claim demonstrable. Phase 4 documents the OTLP-to-APM-Server and EDOT alternatives and when each is right.                                        |
 | Demo app                  | Spring Boot 3.5 on Java 21                | Instrumented by the OTel Java agent, which covers Tomcat, Spring AMQP, the AMQP client, the Mongo driver, OkHttp and Logback — the whole path — with no code change and no OTel dependency for tracing.                           |
+| Java instrumentation delivery | baked `-javaagent` in phases 2–4, Operator injection from phase 5 | Both survive side by side in Phase 5 so the trade-off table is written from experience. Injection is what the target environment uses; the baked agent is what you fall back to when the webhook is not there. |
 | Local runtime, phases 0–4 | Docker Compose                            | Kubernetes adds a second learning axis (operators, CRDs, RBAC, DaemonSets) that obscures the OTEL concepts.                                                                                                                       |
-| Local runtime, phase 5    | **k3d**                                   | ~500 MB overhead vs ~1 GB for kind and ~2 GB for minikube. Ships Traefik and a LoadBalancer so `http://grafana.localhost` works with no port-forward. Diverges slightly from upstream (sqlite instead of etcd) — irrelevant here. |
+| Local runtime, phases 5–7 | **k3d**                                   | ~500 MB overhead vs ~1 GB for kind and ~2 GB for minikube. Ships Traefik and a LoadBalancer so a hostname works with no port-forward. Diverges slightly from upstream (sqlite instead of etcd) — irrelevant here.               |
+| Off-cluster infra, phases 6–7 | plain Docker on the host, outside the k3d network | Reproduces the network and identity boundary — no `k8s.*` attributes, no Kubernetes discovery, `host.k3d.internal` to reach it — at near-zero RAM cost. Real VMs would add systemd, host metrics and OS patching; that gap is stated in the Phase 6 explainer rather than papered over. |
 | Container runtime         | OrbStack recommended over Docker Desktop  | Roughly half the idle RAM, faster disk, same CLI. On 16 GB this is not cosmetic.                                                                                                                                                  |
 
 ---
@@ -99,18 +132,25 @@ binding constraint on the whole project.
 | Collector                           | 0.3 GB     |
 | Grafana + Prometheus + Loki + Tempo | 2.0 GB     |
 | Elasticsearch + Kibana              | 3.0 GB     |
-| k3s control plane (phase 5)         | 0.5 GB     |
+| k3s control plane (phases 5–7)      | 0.5 GB     |
+| Collector fleet (agent DaemonSet ×3 + gateway + 2 off-cluster) | 0.6 GB |
 
 **Rules that follow from this:**
 
 - Never run the Grafana stack and the Elastic stack at the same time, except for
-  the single deliberate fan-out exercise in Phase 4 — and then with the demo app
-  and one infra system only.
+  the single deliberate fan-out exercise in the Phase 4 appendix — and then with
+  the demo app and one infra system only.
 - Set `mem_limit` on every Compose service and `resources.limits` on every
   Kubernetes pod. An unbounded Elasticsearch will take the machine down.
 - Elasticsearch heap must be pinned: `ES_JAVA_OPTS=-Xms1g -Xmx1g`.
 - In Phase 5, `k3d cluster create --agents 2` is enough. Three agents plus all
   workloads will not fit.
+- From Phase 5, Elasticsearch and Kibana stay on Compose rather than moving into
+  the cluster. A real cluster does not host its own backend either, so this is
+  fidelity as well as thrift.
+- Phase 5 runs the app and RabbitMQ only. Phase 6 adds MongoDB and MinIO
+  off-cluster. Do not attempt to run the Phase 3 Compose stack and the Phase 5
+  cluster simultaneously — Phase 6's off-cluster containers replace it.
 
 ---
 
@@ -125,14 +165,26 @@ README.md                     roadmap + how to run a phase
 docs/
   CURRICULUM.md               this file
   phase-N-<slug>.html         the explainer for phase N
+  onboarding-a-service.md     team doc  (created in phase 7)
+  attribute-policy.md         team doc  (created in phase 7)
+  review-checklist.md         team doc  (created in phase 7)
 phase-N/
   docker-compose.yaml         (phases 0–4)
   otel-collector-config.yaml
   <service>/                  per-service config, e.g. tempo/, loki/, grafana/
   README.md                   run instructions + verification for this phase only
+phase-5/
+  k8s/                        manifests, Helm values, Operator CRs
+phase-6/
+  k8s/                        gateway + agent Collector config for both designs
+  off-cluster/                docker-compose.yaml for Mongo + MinIO, outside k3d
+  off-cluster-collector/      the VM-side Collector config (design B)
 app/                          the Spring Boot demo app (created in phase 2)
-k8s/                          manifests and Helm values (created in phase 5)
 ```
+
+Phases 5–7 are Kubernetes phases and have no `docker-compose.yaml` of their own
+for the cluster workloads, but each keeps one for the pieces that stay outside
+it — Elasticsearch and Kibana, and from Phase 6 the off-cluster infra.
 
 ### Version pinning
 
@@ -197,7 +249,7 @@ not invent plausible-looking log lines.
 
 ## Definition of done
 
-A phase is not finished until all six hold:
+A phase is not finished until all seven hold:
 
 1. `docker compose up -d` (or the k3d equivalent) comes up clean from an empty state.
 2. The verification steps in the phase's `README.md` pass, and the output was
@@ -206,7 +258,9 @@ A phase is not finished until all six hold:
    matches the prediction written in the table.
 4. Every image tag is pinned and verified to exist.
 5. Memory limits are set on every service and the whole stack fits the budget.
-6. `docker compose down -v` leaves nothing behind.
+6. `docker compose down -v` (or `k3d cluster delete obs`) leaves nothing behind.
+7. The six "answer these before Phase N+1" questions in the explainer can
+   actually be answered from what was built, not from what was read.
 
 ---
 
@@ -586,66 +640,161 @@ correlation.
 | Add `user_id` as a metric label in the app | watch series count climb in Prometheus `/status` — the Phase 0 lesson, in production    |
 
 ---
+## Phase 4 — Elastic as the destination
 
-## Phase 4 — Swap in Elasticsearch and Kibana
+**Objective.** Get the whole Phase 3 pipeline landing in Elasticsearch, and
+learn Kibana's Observability and APM apps well enough to teach them. This is no
+longer a comparison exercise — Elastic is where this project is going. The
+Grafana comparison survives as an appendix at the end of the phase, because
+having built both is exactly what lets you defend the choice to a team.
 
-**Objective.** Prove the seam claim from Phase 0 and form a real opinion about
-the two backends. The application and every receiver stay untouched; only the
-`exporters` and `service.pipelines` blocks change.
+The application and every receiver stay untouched. Only `exporters` and
+`service.pipelines` change. That is still the seam claim from Phase 0, and it is
+still worth proving — you just prove it in the direction that matters.
+
+**Concepts.**
+
+- The three routes OTel data can take into Elastic, and which one a given
+  cluster is using
+- `mapping.mode: otel` vs `ecs` — the mapping decision, and why it is close to
+  one-way
+- Data streams, index templates, component templates, ILM: where telemetry
+  physically lands and what ages it out
+- ES|QL, and how it differs from writing three languages against three stores
+- The APM app: services, transactions, dependencies, the service map — and what
+  in the OTLP payload each view is actually reading
+- Log ↔ trace correlation in Elastic, which is a field join (`trace.id`) rather
+  than a datasource configuration
+
+### The three routes in
+
+Know all three. Your work cluster uses one of them, and which one changes who
+owns the config.
+
+| Route | How | When it is right |
+| --- | --- | --- |
+| **A. contrib Collector → `elasticsearch` exporter** | The stock `otel/opentelemetry-collector-contrib` image writes directly to `:9200` over the ES bulk API | Self-managed Elastic; you already run a Collector; you want one pipeline shape across every backend. **This is what this phase builds.** |
+| **B. Collector → OTLP → APM Server / managed OTLP intake** | Export OTLP to Elastic's own OTLP endpoint and let Elastic do the mapping server-side | Elastic Cloud, or an existing APM Server. Fewer knobs, Elastic owns the mapping, version-coupled to the stack. |
+| **C. EDOT — Elastic Distribution of OpenTelemetry** | Elastic's own Collector build and SDK distros, preconfigured for Elastic | Elastic-supported path with curated dashboards and defaults. Upstream OTel plus Elastic opinions. |
+
+Build route A. Then read the EDOT collector's shipped config and diff it against
+yours — that diff is a list of the opinions Elastic holds about telemetry, and
+it is genuinely instructive. Note in the explainer which route the work cluster
+uses and how you determined that.
 
 **Components.** Elasticsearch single-node with security disabled for local use,
-plus Kibana. Use the Collector's `elasticsearch` exporter with
-`mapping.mode: otel`, which writes to the OTel-native data streams
-(`traces-generic.otel-default`, `logs-generic.otel-default`,
-`metrics-generic.otel-default`) that Kibana's Observability app understands.
+plus Kibana. Pin the heap.
 
 ```yaml
 exporters:
   elasticsearch:
     endpoints: [http://elasticsearch:9200]
     mapping:
-      mode: otel
+      mode: otel               # see the mapping decision below
     logs_dynamic_index:    { enabled: true }
     traces_dynamic_index:  { enabled: true }
     metrics_dynamic_index: { enabled: true }
 ```
 
-Elastic also ships EDOT, its own Collector distribution. Mention it; do not use
-it — using the same stock contrib Collector is precisely what demonstrates the
-point.
+`mapping.mode: otel` writes the OTel-native data streams
+(`traces-generic.otel-default`, `logs-generic.otel-default`,
+`metrics-generic.otel-default`) that Kibana's Observability app understands.
 
-**The fan-out exercise.** For one session only, add both backends to every
-pipeline:
+### The mapping decision
+
+The single most consequential line in the exporter config.
+
+| | `mode: otel` | `mode: ecs` |
+| --- | --- | --- |
+| Field names | OTel semconv, dots preserved (`http.request.method`) | Elastic Common Schema; ECS and semconv have been converging but are not identical |
+| Attributes | nested under `attributes`, `resource.attributes`, `scope.attributes` | flattened to top-level ECS fields |
+| Kibana APM | native support, the intended path | works, historically the better-supported path |
+| Pre-existing ECS dashboards and Beats data | will not match | will match |
+| Reversibility | reindexing is the only way back | same |
+
+Pick `otel`, document why, and be explicit in the explainer that a team with
+years of ECS dashboards and Filebeat data has a real reason to pick `ecs`
+instead. Mixed modes in one deployment is the failure case: two field names for
+one concept, and every dashboard works for half the data.
+
+### Storage and lifecycle
+
+The part Grafana users skip and then get billed for.
+
+- Find the data streams: `GET _data_stream/*otel*`
+- Find what shaped them: `GET _index_template/*otel*` and the component
+  templates it composes
+- Field mappings are the cost driver, not row count. `GET <index>/_mapping` and
+  count the fields. An unbounded attribute key namespace is a mapping explosion,
+  which is the Elastic-shaped version of the Phase 0 cardinality lesson —
+  Phase 7 does the arithmetic.
+- Attach an ILM policy with a short hot phase and a delete phase, then verify it
+  applied. Untouched local defaults keep everything forever.
+
+### Kibana
+
+- **Observability → Logs** with `service.name` filters; confirm the
+  `trace.id` field is populated on app logs (that is Phase 2's Logback MDC
+  work arriving)
+- **APM → Services**: `order-api` and `order-worker` as distinct services;
+  transaction latency distribution; the dependency map showing MongoDB,
+  RabbitMQ and MinIO as downstream dependencies inferred from client spans
+- **The service map** — check whether the RabbitMQ hop connects `order-api`
+  to `order-worker`. If it does not, context propagation broke; that is a
+  Phase 2 regression and worth catching here.
+- Click from a slow transaction to its logs and back. Count the clicks; you
+  will compare that number in the appendix.
+- Write three questions in ES|QL that you already wrote in PromQL, LogQL and
+  TraceQL in Phase 3.
+
+**Verification.** All three signals from all three infra systems plus the demo
+app visible in Kibana. A trace opened from APM, its logs reachable in one click,
+and the MongoDB log line from the same time window findable by free-text
+search. `GET _cat/indices?v` shows the otel data streams with non-zero doc
+counts.
+
+**Breaks.**
+
+| Do this | Predict, then check |
+| --- | --- |
+| Switch one pipeline to `mapping.mode: ecs`, leave the others on `otel` | which Kibana views break, and what the field names become |
+| Stop Elasticsearch, keep sending | Collector `sending_queue` fills, then refuses; watch `otelcol_exporter_send_failed_*` |
+| Drop `service.name` in a `transform` processor | what APM shows for that service, and where the data actually went |
+| Send a metric with 50k distinct attribute values | mapping and index size, not series count — the different shape of the same mistake |
+
+### Appendix: the Grafana comparison
+
+You have now run both stacks over identical data. Fill this in with
+measurements, not opinions. For one session only, fan out every pipeline to both
+backends — with the demo app and one infra system only, because the RAM will not
+take more:
 
 ```yaml
 service:
   pipelines:
     traces:
-      exporters: [otlp/tempo, elasticsearch]
+      exporters: [otlp_grpc/tempo, elasticsearch]
 ```
 
-Identical data, two stores, side by side. Run it with the demo app and one infra
-system only — the RAM will not take more.
-
-**Comparison to fill in with measurements, not opinions.**
-
-| Dimension         | Measure it by                                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------------------------------ |
-| Storage footprint | `GET _cat/indices?v` bytes vs `du -sh` on the Loki and Tempo volumes, same ingest                            |
-| Memory            | `docker stats` steady-state RSS for each stack                                                               |
-| Query ergonomics  | write the same three questions in PromQL/LogQL/TraceQL and in ES\|QL/KQL, time yourself                      |
-| Correlation UX    | trace → logs and log → trace, click count in each UI                                                         |
-| Ad-hoc search     | "find every occurrence of this stack trace in the last 24h" — Loki without a matching label vs Elasticsearch |
-| Alerting          | build one identical alert in both                                                                            |
-| Cost model        | index-everything vs index-labels-only, and what that means at 100× the volume                                |
+| Dimension | Measure it by |
+| --- | --- |
+| Storage footprint | `GET _cat/indices?v` bytes vs `du -sh` on the Loki and Tempo volumes, same ingest |
+| Memory | `docker stats` steady-state RSS for each stack |
+| Query ergonomics | the same three questions in PromQL/LogQL/TraceQL vs ES\|QL; time yourself |
+| Correlation UX | trace → logs and log → trace, click count in each UI |
+| Ad-hoc search | "find every occurrence of this stack trace in the last 24h" — Loki without a matching label vs Elasticsearch |
+| Alerting | build one identical alert in both |
+| Cost model | index-everything vs index-labels-only, and what that means at 100× the volume |
 
 Expect the honest answer to be: Elastic wins ad-hoc search decisively, Grafana
-wins metrics ergonomics and cost decisively, and correlation is roughly a tie.
+wins metrics ergonomics and cost decisively, correlation is roughly a tie. Write
+down the one that surprised you.
 
 **Gotchas.**
 
 - `xpack.security.enabled=false` and `discovery.type=single-node` for local, and
-  say clearly in the explainer that both are unacceptable in production.
+  say clearly in the explainer that both are unacceptable in production. Phase 7
+  turns security back on.
 - Pin the heap: `ES_JAVA_OPTS=-Xms1g -Xmx1g`. Elasticsearch will otherwise size
   itself to the host and evict everything else.
 - `vm.max_map_count` must be at least 262144. On Docker Desktop and OrbStack it
@@ -653,13 +802,24 @@ wins metrics ergonomics and cost decisively, and correlation is roughly a tie.
 - Kibana must match the Elasticsearch major version exactly.
 - Elasticsearch is slow to become healthy. Give Kibana a `depends_on` with
   `condition: service_healthy` or it will crash-loop on first boot.
+- The `elasticsearch` exporter's mapping modes have moved between Collector
+  releases. Verify the mode name against the exporter README for the exact
+  pinned version rather than trusting an older example.
+- Elastic infers dependencies in the service map from **client** spans. If the
+  Mongo driver instrumentation is missing, MongoDB simply does not appear — no
+  error anywhere.
 
 ---
 
-## Phase 5 — Kubernetes on k3d
+## Phase 5 — Kubernetes and the OpenTelemetry Operator
 
-**Objective.** Move everything onto Kubernetes and learn the two-tier Collector
-topology that real clusters use.
+**Objective.** Move the application and RabbitMQ onto Kubernetes, and learn the
+Operator-driven auto-instrumentation that the target environment runs. Infra
+stays out deliberately — MongoDB and MinIO are not deployed here. Phase 6 puts
+them outside the cluster, which is where they actually live.
+
+This mirrors the target environment: Spring Boot on k8s, instrumented by
+annotation, RabbitMQ as a Helm chart in-cluster, telemetry to Elastic.
 
 **Cluster.**
 
@@ -673,16 +833,22 @@ k3d cluster create obs \
 Import the locally-built demo app image with `k3d image import` — there is no
 registry.
 
+**Workloads.** The demo app (`order-api`, `order-worker`) and RabbitMQ via its
+Helm chart in a genuine multi-node cluster with quorum queues. Elasticsearch and
+Kibana stay on Compose, reachable from the cluster — a real cluster does not run
+its own backend either, and keeping them out saves the RAM.
+
 **Concepts.**
 
-- **Agent vs gateway.** A DaemonSet Collector on every node collects
-  node-local data (pod logs, kubelet stats, host metrics) and forwards OTLP to a
-  Deployment Collector that does cluster-wide work (enrichment, tail sampling,
-  export). Draw this; it is the single most important diagram of the phase.
+- **Agent vs gateway.** A DaemonSet Collector on every node collects node-local
+  data (pod logs, kubelet stats, host metrics) and forwards OTLP to a Deployment
+  Collector that does cluster-wide work (enrichment, tail sampling, export).
+  Draw this; it is the single most important diagram of the phase, and Phase 6
+  extends it past the cluster edge.
 - The **OpenTelemetry Operator** (`OpenTelemetryCollector` and `Instrumentation`
-  CRDs, auto-instrumentation by pod annotation — see the injection step below)
-  versus the plain Helm chart. The Operator needs cert-manager. Show the
-  Operator, but be explicit that the Helm chart alone is a legitimate choice.
+  CRDs, auto-instrumentation by pod annotation) versus the plain Helm chart. The
+  Operator needs cert-manager. Show the Operator, but be explicit that the Helm
+  chart alone is a legitimate choice.
 - `k8sattributes` processor — how pod IP to pod metadata lookup works, the RBAC
   it needs, and why every signal should carry `k8s.namespace.name`,
   `k8s.pod.name`, `k8s.deployment.name`
@@ -691,9 +857,12 @@ registry.
 - The Target Allocator, and how Prometheus `ServiceMonitor` CRDs get discovered
   and sharded across Collector replicas
 
-**Step: re-instrument the demo app by injection, not by image.** Phase 2 baked
-`-javaagent:` into the container's entrypoint. Undo that here and let the
-Operator do it, so the same jar is instrumented by cluster configuration alone.
+### Re-instrument the demo app by injection, not by image
+
+Phase 2 baked `-javaagent:` into the container's entrypoint. **Keep that image
+as-is** and add a second deployment that relies on injection, so both paths run
+side by side and can be compared. The injected deployment must have the flag
+removed — the double-agent failure below is the lesson.
 
 The mechanism is a **mutating admission webhook**. On pod creation the Operator
 rewrites the pod spec before the scheduler ever sees it:
@@ -726,7 +895,7 @@ metadata:
   namespace: demo
 spec:
   exporter:
-    endpoint: http://otel-gateway-collector.observability.svc.cluster.local:4318
+    endpoint: http://otel-agent-collector.observability.svc.cluster.local:4318
   propagators: [tracecontext, baggage]
   sampler:
     type: parentbased_always_on
@@ -755,9 +924,25 @@ single pod out. The same annotation works on a `Namespace` object, which
 instruments every pod in it — that is how this is used at scale, and it is
 worth doing once to see it.
 
-Point the exporter at the **DaemonSet agent** Collector, not the gateway, once
-that tier exists — the injected endpoint is the one place the two-tier topology
-becomes concrete for the application.
+Point the exporter at the **DaemonSet agent** Collector, not the gateway — the
+injected endpoint is the one place the two-tier topology becomes concrete for
+the application.
+
+### The three instrumentation paths, compared
+
+You now have the material to fill this in from experience rather than from docs.
+This table is the thing your team will actually ask you about.
+
+| Path | Where the decision lives | Cost | Fails when |
+| --- | --- | --- | --- |
+| `-javaagent:` in the image (Phase 2) | Dockerfile / entrypoint — the app team | every service rebuilds to change agent version | you need to opt one pod out, or roll the agent fleet-wide |
+| Operator injection (this phase) | `Instrumentation` CR + annotation — the platform team | needs Operator, cert-manager, webhook availability | pods are not recreated; GraalVM native images; webhook is down |
+| `opentelemetry-spring-boot-starter` | build dependency — the app team | a compile-time dependency and real code | you wanted zero app change |
+
+Run the first two simultaneously in this phase and compare the resulting spans:
+they should be indistinguishable in Elastic APM apart from `service.name`. If
+they are not, find out why — that difference is agent version drift, and it is
+the argument for injection in one sentence.
 
 **Gotchas.**
 
@@ -769,49 +954,176 @@ becomes concrete for the application.
   `kubectl get pod -o yaml` and look for the initContainer.
 - If the image's entrypoint already sets `JAVA_TOOL_OPTIONS`, the injected
   value is appended to it; two `-javaagent` flags for the same agent will fail
-  at startup. Remove Phase 2's flag.
+  at startup. This is exactly what happens if you annotate the Phase 2 image
+  without removing its flag — do it once on purpose and read the JVM error.
 - `service.name` resolution order matters: `OTEL_SERVICE_NAME` in the container
   beats the `resource.opentelemetry.io/service.name` annotation, which beats
   the Operator's fallback of `<deployment name>`. Getting `order-worker` and
   `order-api` to stay distinct is the test.
 - **Not usable with GraalVM native images.** A native executable is not a JVM;
   it ignores `JAVA_TOOL_OPTIONS` and cannot load a `-javaagent`. That path needs
-  the `opentelemetry-spring-boot-starter` compiled in — the Phase 2 table's
-  second row, and the concrete reason it exists.
-
-**Verification.** Traces for `order-api` and `order-worker` appear in Tempo
-with the same shape as Phase 2, from an image containing no OpenTelemetry code.
-`kubectl get pod <api-pod> -o jsonpath='{.spec.initContainers[*].name}'` shows
-`opentelemetry-auto-instrumentation-java`. Deleting the annotation and
-restarting makes the traces stop.
-
-**Workloads.** Use operators or charts that produce genuine HA topologies:
-MongoDB Community Operator or a Bitnami chart in replica-set mode, the RabbitMQ
-Cluster Operator, and the MinIO Operator or tenant chart. Grafana, Prometheus,
-Loki and Tempo as individual charts with explicit small resource limits — not
-`kube-prometheus-stack`, which will not fit.
+  the `opentelemetry-spring-boot-starter` compiled in — the third row above, and
+  the concrete reason it exists.
+- If the webhook's certificate has expired or cert-manager is unhealthy, pod
+  creation itself can fail cluster-wide depending on the webhook's
+  `failurePolicy`. Know which policy the Operator installed.
 
 **RBAC.** `k8sattributes` needs `get`/`list`/`watch` on `pods` and `namespaces`
 cluster-wide; `kubeletstats` needs `nodes/stats` and `nodes/proxy`. Getting a
 403 here and reading the Collector's own logs to find it is a worthwhile
 exercise — leave it as a deliberate break.
 
-**Verification.** Every span, metric and log carries the correct
-`k8s.pod.name` and `k8s.namespace.name`. Killing a Mongo pod shows the election
-in Grafana *and* attributes the change to the right pod. `http://grafana.localhost:8080`
-resolves through Traefik with no port-forward.
+**Verification.** Traces for `order-api` and `order-worker` appear in Elastic
+APM with the same shape as Phase 2, from an image containing no OpenTelemetry
+code. `kubectl get pod <api-pod> -o jsonpath='{.spec.initContainers[*].name}'`
+shows `opentelemetry-auto-instrumentation-java`. Deleting the annotation and
+restarting makes the traces stop. Every span, metric and log carries the correct
+`k8s.pod.name` and `k8s.namespace.name`. Kibana resolves through Traefik with no
+port-forward.
 
 ---
 
-## Phase 6 — Production concerns
+## Phase 6 — The hybrid boundary: infrastructure outside the cluster
 
-**Objective.** Everything that separates a demo from something you would run.
+**Objective.** The phase that mirrors the real environment most closely, and the
+one with no good blog post behind it. MongoDB and MinIO live **outside** the
+Kubernetes cluster. Everything the last phase taught about `k8sattributes`,
+pod-log tailing and Kubernetes service discovery is unavailable for half the
+estate. Design the pipeline that spans the boundary anyway, and keep telemetry
+from both sides correlatable in one Kibana view.
+
+**Local representation.** Run MongoDB (replica set) and MinIO (4-drive erasure
+set) as plain Docker containers on the host, **outside the k3d network** — not
+in the cluster and not on the cluster's Docker network. The cluster reaches them
+via `host.k3d.internal`. That reproduces the network and identity boundary at
+near-zero extra RAM. It does not reproduce OS-level concerns (a Collector as a
+systemd unit, host patching, real host metrics); note that gap explicitly in the
+explainer, because it is a gap your team will have to close for real.
+
+**Concepts.**
+
+- The two designs, and why the choice is usually made by the firewall rather
+  than by engineering
+- Identity without Kubernetes: `resourcedetection/system` gives `host.name`,
+  `os.type`, `host.arch`. There is no `k8s.pod.name` and never will be. What do
+  you join on instead?
+- Keeping `service.name`, `service.namespace` and `deployment.environment`
+  consistent across two worlds so that Elastic correlates them at all
+- Static targets vs dynamic discovery — `file_sd_configs` as the middle ground
+- Credential ownership across an administrative boundary
+- Securing the OTLP hop when it leaves the cluster network: TLS, mTLS, auth
+  headers, and the `oauth2client` / `bearertokenauth` extensions
+- The Collector as a thing you now operate in two places
+
+### Design A — pull: in-cluster Collector scrapes the VMs
+
+```
+┌─ k8s cluster ──────────────────┐          ┌─ VM: mongo ──────────┐
+│  agent DaemonSet ─┐            │          │ mongod               │
+│                   ├─→ gateway ─┼──scrape──┤ mongodb_exporter     │
+│  app pods ────────┘      │     │          └──────────────────────┘
+│                          │     │          ┌─ VM: minio ──────────┐
+└──────────────────────────┼─────┼──scrape──┤ /minio/v2/metrics/*  │
+                           ▼                └──────────────────────┘
+                     Elasticsearch
+```
+
+The gateway Collector holds a `prometheus` receiver with `static_configs` (or
+`file_sd_configs`) pointing at the VM endpoints, plus the `mongodb` receiver.
+
+| | |
+| --- | --- |
+| Good | one place to configure; nothing to install or patch on the VMs; credentials live in cluster Secrets |
+| Bad | cluster → VM ingress must be open on every metrics port; no logs, because nothing is tailing the VM's files; scrape failures look like VM outages; the target list is hand-maintained |
+
+### Design B — push: a Collector on each VM
+
+```
+┌─ VM: mongo ──────────────┐
+│ mongod                   │
+│ otelcol (systemd)        │──OTLP──┐
+│  ├ mongodb receiver      │        │   ┌─ k8s cluster ─────────┐
+│  ├ filelog → mongod.log  │        ├──→│ gateway Collector ────┼──→ Elasticsearch
+│  └ hostmetrics           │        │   └───────────────────────┘
+└──────────────────────────┘        │
+┌─ VM: minio ──────────────┐        │
+│ otelcol → prometheus,    │──OTLP──┘
+│   filelog, hostmetrics   │
+└──────────────────────────┘
+```
+
+| | |
+| --- | --- |
+| Good | logs and host metrics become possible; one outbound port only; credentials stay local to the machine that owns them; local buffering survives a cluster outage |
+| Bad | a Collector fleet to install, configure, patch and monitor on machines you may not own; config drift; the VM team now has an observability dependency |
+
+**Build both.** Then write down which one the work environment should use and
+why, in one paragraph, naming the constraint that decides it.
+
+### Correlation across the boundary — the actual exercise
+
+Getting bytes into Elastic from both sides is the easy half. The hard half is
+that a span from a pod and a log line from a VM must be findable as facts about
+one incident.
+
+- Same `deployment.environment` on both sides, set once by an `attributes`
+  processor at the gateway rather than trusted from each source
+- `service.name` for infra: is Mongo a *service* (`mongodb`) or an *attribute
+  of the host*? Pick one convention, apply it to all three systems, and write
+  it down — this is the first entry in the attribute policy that Phase 7 turns
+  into a team document
+- MongoDB emits no spans. The join between an `order-api` span and a `mongod`
+  slow-query log is **time plus host plus database name**, not `trace.id`.
+  Build that query in Kibana and see how weak the join is; that weakness is the
+  argument for keeping client-side Mongo spans rich.
+- Where does the timestamp come from on each path, and are the clocks the same?
+
+**Verification.** A single Kibana session in which you: open a slow
+`order-api` transaction in APM; identify the MongoDB call inside it; jump to
+`mongod` logs from the right host in the same time window; and confirm the
+`host.name` there matches the one on the metrics that showed the latency. All
+of it from telemetry that crossed an administrative boundary.
+
+**Breaks.**
+
+| Do this | Predict, then check |
+| --- | --- |
+| Block the scrape port (Design A) | what the Collector logs, what appears in Kibana, and whether it looks like a Mongo outage |
+| Kill the VM Collector (Design B) | what is lost, for how long, and whether anything alerts |
+| Skew a VM clock by 10 minutes | what correlation looks like when time is the only join key |
+| Give the VM telemetry a different `deployment.environment` | how it silently splits every dashboard |
+| Restart Elasticsearch with Design B running | whether the VM Collector's `sending_queue` and `file_storage` actually saved the data |
+
+**Gotchas.**
+
+- `k8sattributes` cannot enrich telemetry that did not come from a pod. Applied
+  indiscriminately it either no-ops or, worse, attaches the *gateway pod's* own
+  identity to VM data. Scope it to the right pipeline.
+- `host.k3d.internal` resolves inside the cluster; `localhost` in a Collector
+  config inside a pod means the pod. This is the most common first failure.
+- MinIO metrics return 401 unless `MINIO_PROMETHEUS_AUTH_TYPE=public` or a
+  bearer token from `mc admin prometheus generate` is in the scrape config.
+  Across a boundary, "public" is not an option — do the token properly here.
+- The MongoDB monitoring user needs `clusterMonitor`. Whoever owns the VM has
+  to create it, which is a conversation, not a config change.
+- OTLP over a network you do not control needs TLS. `tls.insecure: true` was
+  fine for Compose and is not fine here — this is the phase to turn it off.
+- A push Collector with no `file_storage`-backed queue loses everything during a
+  cluster outage, which is precisely when you want the data.
+
+---
+
+## Phase 7 — Production concerns and team practices
+
+**Objective.** Everything that separates a demo from something you would run —
+and then the artefacts that let a team run it without you.
 
 **Sampling.**
 
 - Head sampling: `OTEL_TRACES_SAMPLER=parentbased_traceidratio` — cheap, decided
   at the first span, and therefore blind to whether the trace turned out to be
-  interesting.
+  interesting. With Operator injection this is set in the `Instrumentation` CR,
+  which means the platform team changes it for everyone at once.
 - Tail sampling: the `tailsampling` processor with `latency`, `status_code`,
   `probabilistic` and `rate_limiting` policies composed together — keeps every
   error and every slow trace, drops most of the boring ones.
@@ -819,16 +1131,31 @@ resolves through Traefik with no port-forward.
   a trace to reach the same Collector instance**. That forces a gateway tier and
   a `loadbalancing` exporter with `routing_key: traceID` in front of it. Draw
   this; it is why Phase 5's two-tier topology exists.
+- The Elastic-specific fork: sampling can be done in the Collector *or* by APM
+  Server. Doing both is a common and expensive mistake. Decide where it lives
+  and say so in the team doc.
 
-**Cardinality and cost control.** `filter` and `transform` (OTTL) to drop series
-and redact attributes · `deltatocumulative` where a backend needs cumulative ·
-metric renaming and aggregation with `metricstransform` · a written policy for
-what may and may not be a metric label.
+**Cardinality and cost — recomputed for Elastic.** The Prometheus series
+arithmetic from Phase 0 does not transfer. In an index-everything store the cost
+drivers are different:
+
+- **Field mappings.** Every new attribute *key* is a new mapped field. Unbounded
+  key namespaces (`attributes.user.<id>`) cause mapping explosion, which is a
+  cluster-stability problem, not just a bill. Check the mapping field count
+  against `index.mapping.total_fields.limit`.
+- **Document count and size.** Every span and log line is a document. Sampling
+  and log-level policy are the levers.
+- **ILM.** Hot/warm/cold/delete phases per data stream, and the honest answer to
+  "how long do we actually need traces for".
+- Tools: `filter` and `transform` (OTTL) to drop and redact · `metricstransform`
+  for renaming and aggregation · `deltatocumulative` where a backend needs it.
+- Deliverable: a written policy for what may and may not become an attribute.
 
 **Reliability of the pipeline itself.** `sending_queue` backed by the
 `file_storage` extension so a backend restart does not lose data ·
 `retry_on_failure` tuning · `memory_limiter` sizing · what actually happens when
-the queue fills.
+the queue fills. Do this on both tiers *and* on the Phase 6 VM Collectors, which
+are the ones with no neighbour to fail over to.
 
 **Observing the Collector.** It emits its own metrics. Scrape them and alert on
 them:
@@ -841,14 +1168,46 @@ otelcol_exporter_queue_size     / otelcol_exporter_queue_capacity
 ```
 
 An unmonitored telemetry pipeline that silently drops data is worse than no
-pipeline, because it produces confident, wrong dashboards.
+pipeline, because it produces confident, wrong dashboards. With Operator-managed
+Collectors, also watch the webhook: a pod that starts *without* injection
+produces no error and no telemetry.
 
-**Alerting and SLOs.** Define an SLO for the demo app, implement multi-window
-multi-burn-rate alerts in Grafana, and build the same alert in Kibana. Alert on
-symptoms (latency, error rate, queue depth) rather than causes (CPU).
+**Security, turned back on.** Everything Phase 4 disabled for local
+convenience: `xpack.security.enabled`, TLS on Elasticsearch, an API key per
+Collector with least-privilege index permissions rather than a superuser, TLS
+and auth on every OTLP hop, and secrets out of Collector YAML via env expansion
+and Kubernetes Secrets.
 
-**Also cover.** Secure OTLP with TLS and auth headers · semantic-convention
-drift and schema URLs · what to do when the Collector is the bottleneck.
+**Alerting and SLOs.** Define an SLO for the demo app and implement it in
+Kibana — the SLO feature plus a burn-rate rule. Alert on symptoms (latency,
+error rate, queue depth) rather than causes (CPU). Build one identical alert in
+Grafana for comparison, then delete it.
+
+**Also cover.** Semantic-convention drift and schema URLs · what to do when the
+Collector is the bottleneck · agent version rollout strategy across an injected
+fleet.
+
+### Team-facing deliverables
+
+This is the point of the whole project. Three documents, written for colleagues
+who will not read this curriculum.
+
+1. **`docs/onboarding-a-service.md`** — how to add a Spring Boot service to
+   observability in this environment. The annotation, the `service.name`
+   convention, what you get for free, what needs code (custom spans, metrics,
+   MDC), how to verify it worked in Kibana within five minutes, and how to tell
+   whether injection actually happened.
+2. **`docs/attribute-policy.md`** — the naming and cardinality rules. Which
+   semconv attributes are mandatory (`service.name`, `service.namespace`,
+   `deployment.environment`), what may never be an attribute key or a metric
+   label, how to name a custom metric, and who to ask. One page, with examples
+   of both the right and the wrong thing.
+3. **`docs/review-checklist.md`** — what a reviewer looks for in a PR that
+   touches telemetry. Ten lines, checkbox form.
+
+**Verification for the phase.** Hand the onboarding doc to someone who has not
+done this, and watch them instrument a new service without asking you a
+question. Anything they ask is a bug in the doc.
 
 ---
 
@@ -883,10 +1242,33 @@ Consolidated, in the order they will be hit.
 12. Unbounded metric labels — `user_id`, request IDs, full URLs, raw queries.
     Four labels at realistic cardinality is 14,400 series; one user ID label
     makes it 144,000,000.
-13. Not calling `sdk.shutdown()` on `SIGTERM`. The final batch is lost on every
+13. Mixing `mapping.mode: otel` and `ecs` in one deployment. Two field names for
+    one concept; every dashboard then works for half the data, with no error.
+14. Leaving Elasticsearch on its local defaults with no ILM policy. Nothing ages
+    out, and the first symptom is a full disk.
+15. Not calling `sdk.shutdown()` on `SIGTERM`. The final batch is lost on every
     deploy.
-14. Tail sampling behind a plain round-robin load balancer. Spans of one trace
+16. Applying an `Instrumentation` CR and expecting existing pods to change. The
+    webhook fires only at pod creation. `kubectl rollout restart`.
+17. Putting `instrumentation.opentelemetry.io/inject-java` on the Deployment's
+    own metadata instead of `spec.template.metadata.annotations`. No error, no
+    injection, no telemetry.
+18. Annotating a pod whose image already sets `-javaagent` in
+    `JAVA_TOOL_OPTIONS`. Two agents, and the JVM refuses to start.
+19. Expecting Operator injection to work on a GraalVM native image. It cannot;
+    that path needs `opentelemetry-spring-boot-starter` compiled in.
+20. Running `k8sattributes` over telemetry that did not come from a pod. It
+    either no-ops or stamps the gateway's own pod identity onto VM data.
+21. Using `localhost` in a Collector config inside a pod to mean the node or the
+    host. Use `host.k3d.internal` (or the node IP) for off-cluster targets.
+22. Different `deployment.environment` values either side of the cluster
+    boundary. Every dashboard silently splits in two.
+23. A VM-side Collector with no `file_storage`-backed `sending_queue`. It loses
+    exactly the data you wanted during a backend outage.
+24. Tail sampling behind a plain round-robin load balancer. Spans of one trace
     land on different Collectors and traces come out incomplete.
-15. Semantic conventions that moved — `http.method` became
+25. Sampling in both the Collector and APM Server. The rates multiply, and the
+    trace volume you get is not the one you configured.
+26. Semantic conventions that moved — `http.method` became
     `http.request.method`. An empty dashboard panel is usually a renamed
     attribute.
