@@ -30,7 +30,7 @@ loaded — Tomcat, Spring AMQP, the RabbitMQ client, the Mongo driver, OkHttp �
 so that each one opens and closes a span around its own work.
 
 Configuration is entirely `OTEL_*` environment variables, set in
-[`phase-2/docker-compose.yaml`](../phase-2/docker-compose.yaml). Those are the
+`work/w0/docker-compose.yaml`. Those are the
 same spec-defined variables every other OpenTelemetry SDK reads, in any
 language. Nothing in `application.yaml` mentions OpenTelemetry.
 
@@ -72,7 +72,7 @@ counter still accepts `add(1, ...)`, and the numbers go nowhere. Nothing throws.
 mvn -B package
 ```
 
-It is not run from here — `phase-2/docker-compose.yaml` builds and runs it.
+It is not run from here — `work/w0/docker-compose.yaml` builds and runs it.
 The Docker build downloads the agent jar by pinned version:
 
 ```dockerfile
